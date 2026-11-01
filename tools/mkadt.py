@@ -11,9 +11,11 @@ import adt  # noqa: E402
 
 # MSM8916 (Snapdragon 410) RAM mapping
 # Physical RAM begins at 0x80000000 (total 1.5 GB on SM-T560NU -> ends at 0xe0000000).
-# Modem, TrustZone, and SMEM occupy the 0x80000000 - 0x85ffffff region.
-PHYS_BASE = 0x86000000
-MEM_SIZE  = 0x59f00000   # ~1.4 GB available, below 1 MB panic log
+# Regions below 0x90000000 are used by lk2nd, boot.img scratch, TrustZone (0x86000000 tz-apps / smem),
+# and continuous splash FB (0x8e000000).
+# Free contiguous RAM starts safely at 0x90000000 through 0xdf000000 (~1.25 GB).
+PHYS_BASE = 0x90000000
+MEM_SIZE  = 0x4f000000   # ~1.25 GB available, below 1 MB panic log
 PANIC_LOG_SIZE = 0x100000
 
 # MSM8916 Hardware MMIO addresses

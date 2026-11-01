@@ -117,10 +117,29 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5..f8d0d2e 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -745,11 +745,11 @@ common_start:
+@@ -745,11 +745,30 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
++#if defined(SWEET)
++	/* Stage 0.5: green 64x32 band with MMU ON */
++	MOV64	x0, (0x8e000000 + 1200 * 2400 + 64 * 4)
++	MOV64	w1, 0x00ff00
++	mov		x2, #32
++	mov		x4, #2400
++Lsweet_mmu_row:
++	mov		x3, #64
++	mov		x5, x0
++Lsweet_mmu_pixel:
++	str		w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	Lsweet_mmu_pixel
++	add		x0, x0, x4
++	subs	x2, x2, #1
++	b.ne	Lsweet_mmu_row
++	dsb		sy
++#endif
++
 -#if !VMAPPLE
 +#if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
