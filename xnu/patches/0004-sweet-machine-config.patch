@@ -15,7 +15,7 @@ index 8460893..9a748ea 100644
  MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
  MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
-+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto -mcpu=cortex-a53
  
  
  #
@@ -247,7 +247,7 @@ index 0000000..a044ad0
 +#define __ARM_ENABLE_SWAP__       1
 +#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
 +#define __ARM_PAN_AVAILABLE__     1
-+#define __ARM_16K_PG__            1
++#define __ARM_16K_PG__            0
 +
 +#define HAS_GIC_V3                1
 +
@@ -257,10 +257,10 @@ index 0000000..a044ad0
 +
 +/*
 + * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
-+ * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
-+ * (CNTV) is INTID 16 + 3 = 19.
++ * virt, hyp) instead of the usual 13/14/11/10: on APQ8016/MSM8916 GIC-400
++ * the virtual timer XNU uses (CNTV) is INTID 27.
 + */
-+#define SWEET_VTIMER_INTID        19
++#define SWEET_VTIMER_INTID        27
 +#define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
 +
 +#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
@@ -306,7 +306,7 @@ index 9454534..88e524a 100644
 +#include <pexpert/arm64/SWEET.h>
 +
 +#define MAX_L2_CLINE                   6
-+#define MAX_CPUS                       8
++#define MAX_CPUS                       4
 +#define MAX_CPU_CLUSTERS               1
 +
 +#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
