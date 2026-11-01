@@ -1,0 +1,19 @@
+# Binaries and large firmware files
+*.dmg
+*.bin
+*.img
+*.macho
+*.elf
+*.o
+*.a
+*.dSYM
+build/
+out/
+__pycache__/
+*.pyc
+
+# Local scratch / logs
+*.log
+scratch/
+.system_generated/
+lk2nd_log.txt
