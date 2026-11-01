@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,163 @@
 +/*
 + * Single-CPU bring-up for sweet using XNU's legacy IOCPU interface.
 + * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
@@ -136,17 +136,9 @@ new file mode 100644
 +	if (target != this || cpu_number() != (int)getCPUNumber()) {
 +		panic("SWEET CPU: secondary CPU signalling is not implemented");
 +	}
-+	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
-+	unsigned int aff0 = mpidr & 0xff;
-+	if (aff0 >= 16) {
-+		panic("SWEET CPU: SGI target requires unsupported range selector");
-+	}
-+	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
-+	    (((mpidr >> 16) & 0xff) << 32) |
-+	    (((mpidr >> 8) & 0xff) << 16) |
-+	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
++	/* GIC-400 GICD_SGIR: target list filter = 2 (self) */
 +	__builtin_arm_dsb(DSB_ISHST);
-+	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	*(volatile uint32_t *)(gicd_base + 0xF00) = (2U << 24) | (SWEET_IPI_SGI & 0xF);
 +	__builtin_arm_isb(ISB_SY);
 +}
 +

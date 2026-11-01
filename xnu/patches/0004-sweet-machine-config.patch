@@ -86,23 +86,23 @@ index c40c6ea..9888608 100644
 +	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
 +	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
 +	 */
-+	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
-+	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t iar = *(volatile uint32_t *)(gicc_base + 0x0c);
++	uint32_t intid = iar & 0x3ff;
 +
 +	if (intid >= 1020 && intid <= 1023) {
 +		return; /* spurious */
 +	}
-+	if (intid == SWEET_VTIMER_INTID) {
++	if (intid == sweet_vtimer_intid) {
 +		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
 +		cdp->cpu_decrementer = -1; /* Large */
 +		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
 +		rtclock_intr(TRUE);
 +		INTERRUPT_MASKED_DEBUG_END();
-+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(gicc_base + 0x10) = iar;
 +	} else if (intid < 16) {
 +		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
 +		/* Ack before handling so an IPI raised meanwhile is not lost */
-+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(gicc_base + 0x10) = iar;
 +		__builtin_arm_isb(ISB_SY);
 +		cpu_signal_handler();
 +	} else {
@@ -113,7 +113,7 @@ index c40c6ea..9888608 100644
 +			    cdp->interrupt_nub,
 +			    intid);
 +		}
-+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(gicc_base + 0x10) = iar;
 +	}
 +	__builtin_arm_isb(ISB_SY);
 +#else
@@ -168,74 +168,6 @@ index e5336e5..f8d0d2e 100644
  
  #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
  	/* Watchtower
-diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 3ad743f..4ec6989 100644
---- a/pexpert/arm/pe_fiq.c
-+++ b/pexpert/arm/pe_fiq.c
-@@ -141,11 +141,25 @@ pe_init_fiq()
- 		}
- 	}
- 
-+#if defined(SWEET)
-+	/*
-+	 * Real hardware with two security states: Group 0 is TrustZone's and
-+	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
-+	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
-+	 * from the non-secure side even after this write; delivery still works.
-+	 */
-+	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
-+	for (unsigned int i = 0; i < 32; i += 4) {
-+		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
-+	}
-+	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
-+#else
- 	// Configure timers and legacy FIQ to be group 0
- 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
- 
- 	// Enable PPI 27
- 	gicr_write32(GICR_ISENABLER0, (1 << 27));
-+#endif /* SWEET */
- 
- 	// Enable system register access
- 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
-@@ -153,8 +167,12 @@ pe_init_fiq()
- 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
- 	__builtin_arm_isb(ISB_SY);
- 
-+#if defined(SWEET)
-+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
-+#else
- 	// Set priority masks and binary point for group 0
- 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
-+#endif /* SWEET */
- 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
- 
- 	// Set EOI mode of this processor
-@@ -162,12 +180,24 @@ pe_init_fiq()
- 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
- 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
- 
-+#if defined(SWEET)
-+	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
-+	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
-+	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
-+	gicd_write32(GICD_CTLR, gicd_ctlr);
-+	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
-+		;
-+	}
-+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
-+	__builtin_arm_isb(ISB_SY);
-+#else
- 	// Enable the forwarding of the vtimer interrupt
- 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
- 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
- 	gicd_write32(GICD_CTLR, gicd_ctlr);
- 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
- 	__builtin_arm_isb(ISB_SY);
-+#endif /* SWEET */
- }
- #else
- void
 diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
 index 8226b8c..c7d274f 100644
 --- a/pexpert/pexpert/arm64/Makefile
@@ -286,7 +218,7 @@ index 0000000..a044ad0
 +#undef __ARM_PAN_AVAILABLE__
 +#undef __ARM_16K_PG__
 +
-+#define HAS_GIC_V3                1
++#define HAS_GIC_V3                0
 +
 +#ifndef ASSEMBLER
 +#define PLATFORM_PANIC_LOG_DISABLED
