@@ -11,7 +11,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 + * Use the otherwise empty 2MB blocks above low globals and below gVirtBase
 + * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
 + */
-+#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + 2 * ARM_TT_L2_SIZE)
++#define SWEET_EARLY_FB_VA ((gVirtBase & ~ARM_TT_L1_OFFMASK) + 2 * ARM_TT_L2_SIZE)
 +
 +static void
 +sweet_early_map_final(void)
