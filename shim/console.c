@@ -54,9 +54,9 @@ void con_clear(uint32_t bg)
 		for (uint32_t y = 0; y < con_h; y++) {
 			volatile uint8_t *line = (volatile uint8_t *)((uintptr_t)con_fb + y * con_stride);
 			for (uint32_t x = 0; x < con_w; x++) {
-				line[x * 3 + 0] = b;
+				line[x * 3 + 0] = r;
 				line[x * 3 + 1] = g;
-				line[x * 3 + 2] = r;
+				line[x * 3 + 2] = b;
 			}
 		}
 	} else if (con_bpp == 16) {
@@ -87,9 +87,9 @@ void con_rect(int rx, int ry, int rw, int rh, uint32_t color)
 		for (int y = ry; y < ry + rh && y < (int)con_h; y++) {
 			volatile uint8_t *line = (volatile uint8_t *)((uintptr_t)con_fb + y * con_stride);
 			for (int x = rx; x < rx + rw && x < (int)con_w; x++) {
-				line[x * 3 + 0] = b;
+				line[x * 3 + 0] = r;
 				line[x * 3 + 1] = g;
-				line[x * 3 + 2] = r;
+				line[x * 3 + 2] = b;
 			}
 		}
 	} else if (con_bpp == 16) {
@@ -145,9 +145,9 @@ static void put_char(int col, char ch, uint32_t fg)
 								+ (y0 + gy * SCALE + sy) * con_stride)
 								+ (x0 + gx * SCALE) * 3;
 					for (int sx = 0; sx < SCALE; sx++) {
-						p[sx * 3 + 0] = b;
+						p[sx * 3 + 0] = r;
 						p[sx * 3 + 1] = g;
-						p[sx * 3 + 2] = r;
+						p[sx * 3 + 2] = b;
 					}
 				}
 			} else if (con_bpp == 16) {

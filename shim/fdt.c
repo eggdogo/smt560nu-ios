@@ -164,6 +164,8 @@ int fdt_find_simplefb(uintptr_t fdt, uint64_t *base, uint32_t *w, uint32_t *h, u
 					const char *fmt = (const char *)val;
 					if (strstr_check(fmt, "565"))
 						fb_bpp = 16;
+					else if (strstr_check(fmt, "888") && !strstr_check(fmt, "8888") && !strstr_check(fmt, "a8r8g8b8") && !strstr_check(fmt, "x8r8g8b8"))
+						fb_bpp = 24;
 					else
 						fb_bpp = 32;
 				}
