@@ -35,15 +35,7 @@ diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
 index 133b07f..e01c124 100644
 --- a/osfmk/arm64/proc_reg.h
 +++ b/osfmk/arm64/proc_reg.h
-@@ -30,3 +30,7 @@
- #ifndef _ARM64_PROC_REG_H_
- #define _ARM64_PROC_REG_H_
- 
-+#if defined(SWEET) || (defined(__ARM_16K_PG__) && !__ARM_16K_PG__)
-+#undef __ARM_16K_PG__
-+#endif
-+
-@@ -217,6 +221,14 @@
+@@ -213,6 +213,16 @@
  /* D-Cache. */
  #define MMU_CLINE   6
  
@@ -54,6 +46,8 @@ index 133b07f..e01c124 100644
 +
 +/* D-Cache. */
 +#define MMU_CLINE   6
++
++#undef __ARM_16K_PG__
 +
  #elif defined (VMAPPLE)
  
