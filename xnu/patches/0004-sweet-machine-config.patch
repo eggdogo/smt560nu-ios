@@ -124,7 +124,7 @@ index e5336e5..f8d0d2e 100644
 +#if defined(SWEET)
 +	/* Stage 0.5: green 64x32 band with MMU ON */
 +	MOV64	x0, (0x8e000000 + 1200 * 2400 + 64 * 4)
-+	MOV64	w1, 0x00ff00
++	mov		w1, #0xff00
 +	mov		x2, #32
 +	mov		x4, #2400
 +Lsweet_mmu_row:
