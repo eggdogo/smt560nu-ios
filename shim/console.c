@@ -36,12 +36,25 @@ void con_init(uintptr_t fb_base, uint32_t w, uint32_t h, uint32_t stride, uint32
 		con_w = w;
 	if (h)
 		con_h = h;
-	if (bpp)
-		con_bpp = bpp;
 	if (stride)
 		con_stride = stride;
-	else
-		con_stride = con_w * (con_bpp / 8);
+	else if (w && bpp)
+		con_stride = con_w * (bpp / 8);
+
+	/* Determine bpp mathematically from stride and width if possible */
+	if (con_stride && con_w) {
+		uint32_t bytes_per_px = con_stride / con_w;
+		if (bytes_per_px == 3)
+			con_bpp = 24;
+		else if (bytes_per_px == 2)
+			con_bpp = 16;
+		else if (bytes_per_px >= 4)
+			con_bpp = 32;
+		else if (bpp)
+			con_bpp = bpp;
+	} else if (bpp) {
+		con_bpp = bpp;
+	}
 	row = 0;
 }
 

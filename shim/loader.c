@@ -81,7 +81,7 @@ const char *loader_boot(uintptr_t dtb)
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
 
-	con_clear(BLUE);
+	con_skip();
 	con_str("LOADER", "Booting XNU Mach-O...");
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 

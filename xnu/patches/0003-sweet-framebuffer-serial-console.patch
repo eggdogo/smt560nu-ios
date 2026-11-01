@@ -139,7 +139,7 @@ index 997a4ab..db26bbe 100644
 +	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
 +		fbcon_stride = *val;
 +	}
-+	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 3) {
 +		return;
 +	}
 +	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);

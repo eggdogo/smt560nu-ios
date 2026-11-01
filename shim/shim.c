@@ -128,17 +128,18 @@ void shim_main(uint64_t fdt)
 	}
 	con_clear(BLUE);
 
-	/* Diagnostic shapes to identify exact stride/orientation */
-	con_rect(16, 16, 80, 80, WHITE);
-	con_rect(112, 16, 80, 80, YELLOW);
-	con_skip();
+	/* Diagnostic color swatches to verify RGB channels: Red, Green, Blue, White */
+	con_rect(16, 16, 60, 40, RED);
+	con_rect(86, 16, 60, 40, GREEN);
+	con_rect(156, 16, 60, 40, BLUE);
+	con_rect(226, 16, 60, 40, WHITE);
 	con_skip();
 	con_skip();
 
 	con_str("SHIM", "GTEL BOOT SHIM (SM-T560NU)");
 	con_hex2("FB", "fdt=", found_fb, "stride=", con_stride);
-	con_hex2("RES", "w=", con_w, "h=", con_h);
-	con_hex2("ADDR", "base=", (uint64_t)con_fb, 0, 0);
+	con_hex2("MODE", "w=", con_w, "bpp=", con_bpp);
+	con_hex2("ADDR", "base=", (uint64_t)con_fb, "h=", con_h);
 	con_skip();
 
 	/* 2. Hardware sanity inspection */

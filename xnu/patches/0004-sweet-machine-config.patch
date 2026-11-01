@@ -15,7 +15,7 @@ index 8460893..9a748ea 100644
  MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
  MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
-+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -D__ARM_16K_PG__=0 -march=armv8-a+crypto
  
  
  #
@@ -117,25 +117,28 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5..f8d0d2e 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -745,11 +745,30 @@ common_start:
+@@ -745,11 +745,33 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
 +#if defined(SWEET)
 +	/* Stage 0.5: green 64x32 band with MMU ON */
-+	MOV64	x0, (0x8e000000 + 1200 * 2400 + 64 * 4)
-+	mov		w1, #0xff00
-+	mov		x2, #32
++	MOV64	x0, (0x8e000000 + 1200 * 2400 + 64 * 3)
++	mov		w1, #0x00
++	mov		w2, #0xff
++	mov		x6, #32
 +	mov		x4, #2400
 +Lsweet_mmu_row:
 +	mov		x3, #64
 +	mov		x5, x0
 +Lsweet_mmu_pixel:
-+	str		w1, [x5], #4
++	strb	w1, [x5], #1
++	strb	w2, [x5], #1
++	strb	w1, [x5], #1
 +	subs	x3, x3, #1
 +	b.ne	Lsweet_mmu_pixel
 +	add		x0, x0, x4
-+	subs	x2, x2, #1
++	subs	x6, x6, #1
 +	b.ne	Lsweet_mmu_row
 +	dsb		sy
 +#endif

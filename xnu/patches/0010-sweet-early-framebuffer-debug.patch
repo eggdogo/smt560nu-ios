@@ -116,18 +116,29 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,25 @@ Lkernelcache_base_found:
+@@ -609,6 +628,36 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(SWEET)
 +	/*
-+	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
++	 * Splash framebuffer (3MB): two 2MB Normal-NC blocks in the EXISTING V=P
 +	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
 +	 * create_bootstrap_mapping would replace the RAM L2 table.
 +	 * Populate both active TTBR0 L2 table (in x2) and bootstrap pages.
 +	 */
 +	MOV64	x10, 0x8e000000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	str		x11, [x2, x12, lsl #TTE_SHIFT]
++	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x13, x25, #(3 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
++
++	MOV64	x10, 0x8e200000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x11, x11, x10
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
@@ -147,10 +158,10 @@ new file mode 100644
 index 0000000..8f4c808
 --- /dev/null
 +++ b/osfmk/arm64/sweet_early.c
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,138 @@
 +/*
-+ * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
-+ * per-CPU state: panic() can reach this before a current thread exists.
++ * SM-T560NU continuous splash bootstrap console. No allocation, locks, ADT parsing
++ * or per-CPU state: panic() can reach this before a current thread exists.
 + * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
 + * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
 + */
@@ -160,10 +171,10 @@ index 0000000..8f4c808
 +#include <stdint.h>
 +#include <kern/misc_protos.h>
 +
-+#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x8e000000)
-+#define EARLY_WIDTH 600u
++#define EARLY_FB ((volatile uint8_t *)(uintptr_t)0x8e000000)
++#define EARLY_WIDTH 800u
 +#define EARLY_HEIGHT 1280u
-+#define EARLY_STRIDE (2400u / 4)
++#define EARLY_STRIDE 2400u
 +#define EARLY_SCALE 2u
 +#define EARLY_CELL_W (8u * EARLY_SCALE)
 +#define EARLY_CELL_H (16u * EARLY_SCALE)
@@ -180,9 +191,9 @@ index 0000000..8f4c808
 +sweet_early_clear_row(void)
 +{
 +	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
-+		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
-+		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
-+			line[x] = 0xff000000u;
++		volatile uint8_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
++		for (unsigned int x = 0; x < EARLY_WIDTH * 3; x++) {
++			line[x] = 0;
 +		}
 +	}
 +}
@@ -212,13 +223,16 @@ index 0000000..8f4c808
 +	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
 +	for (unsigned int gy = 0; gy < 16; gy++) {
 +		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
-+			volatile uint32_t *line = EARLY_FB +
++			volatile uint8_t *line = EARLY_FB +
 +			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
-+			    early_col * EARLY_CELL_W;
++			    early_col * EARLY_CELL_W * 3;
 +			for (unsigned int gx = 0; gx < 8; gx++) {
-+				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++				uint8_t pixel = (glyph[gy] & (1u << gx)) ? 0xff : 0x00;
 +				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
-+					line[gx * EARLY_SCALE + sx] = pixel;
++					unsigned int px = (gx * EARLY_SCALE + sx) * 3;
++					line[px + 0] = pixel;
++					line[px + 1] = pixel;
++					line[px + 2] = pixel;
 +				}
 +			}
 +		}
@@ -240,10 +254,15 @@ index 0000000..8f4c808
 +	if (early_disabled || stage > 8) {
 +		return;
 +	}
-+	uint32_t color = 0xff00ff00u | (stage * 28u << 16);
++	uint8_t r = (uint8_t)(stage * 28u);
++	uint8_t g = 0xff;
++	uint8_t b = 0x00;
 +	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
-+		for (unsigned int x = stage * 64; x < (stage + 1) * 64; x++) {
-+			EARLY_FB[y * EARLY_STRIDE + x] = color;
++		volatile uint8_t *line = EARLY_FB + y * EARLY_STRIDE;
++		for (unsigned int x = stage * 64; x < (stage + 1) * 64 && x < EARLY_WIDTH; x++) {
++			line[x * 3 + 0] = r;
++			line[x * 3 + 1] = g;
++			line[x * 3 + 2] = b;
 +		}
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
