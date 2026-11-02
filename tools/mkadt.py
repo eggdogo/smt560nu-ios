@@ -173,7 +173,7 @@ def build(target='ipad'):
 
     return node('device-tree', [
         ph(),
-        ('compatible', cstr(board_id) + cstr(model_name) + cstr('samsung,gtelwifiue') + cstr('qcom,msm8916') + cstr('AppleARM')),
+        ('compatible', cstr(board_id) + cstr(model_name) + cstr('xiaomi,sweet') + cstr('samsung,gtelwifiue') + cstr('qcom,msm8916') + cstr('AppleARM')),
         ('model', cstr(model_name)),
         ('target-type', cstr(target_name)),
         ('target-sub-type', cstr(board_id)),

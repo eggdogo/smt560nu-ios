@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eggdogo <eggdogo@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:50:00 -0500
+Subject: [PATCH] sweet: reserve low global bootstrap aperture in kernel_map and tolerate early delete gaps
+
+On Apple platforms without ARM_LARGE_MEMORY, LOW_GLOBAL_BASE_ADDRESS + low_global_vr_size
+(8MB) immediately touched gVirtBase (or was at gVirtBase), seamlessly covering the
+entire low VA range up to virtual_space_start without any gap in kernel_map.
+
+On SWEET (Cortex-A53 / MSM8916), LOW_GLOBAL_BASE_ADDRESS is 0xfffffff000000000,
+while gVirtBase is 0xfffffff007000000 (112 MB above). Hardcoding low_global_vr_size
+to 8 MB left a 104 MB hole (0xfffffff000800000 - 0xfffffff007000000) unreserved in
+kernel_map. Stolen memory for early VM map allocations (0xfffffff0019a2000 - 0xfffffff001a97000)
+fell into this hole, and kmem_scramble_ranges also treated this hole as unallocated free space.
+When overwriting or reclaiming during early boot, vm_map_delete panicked with
+"no map entry at 0xfffffff0019a2000".
+
+1. In pmap_virtual_region(), extend region 2 to span from LOW_GLOBAL_BASE_ADDRESS
+   all the way to (gVirtBase & low_global_vr_mask) (112 MB), ensuring the entire bootstrap
+   aperture is entered into kernel_map as a permanent reservation. Also guard region 0
+   size computation against underflow when virtual_space_start <= *startp.
+2. In vm_map_delete(), tolerate gaps when startup_phase < STARTUP_SUB_ZALLOC on SWEET.
+---
+ osfmk/arm/pmap/pmap.c | 16 ++++++++++++++--
+ osfmk/vm/vm_map.c     |  6 ++++++
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index fc2096f..9d6dba6 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2516,10 +2516,18 @@ pmap_virtual_region(
+ 		/* Round to avoid overlapping with the V=P area; round to at least the L2 block size. */
+ 		if (!TEST_PAGE_SIZE_4K) {
+ 			*startp = gVirtBase & 0xFFFFFFFFFE000000;
+-			*size = ((virtual_space_start - (gVirtBase & 0xFFFFFFFFFE000000)) + ~0xFFFFFFFFFE000000) & 0xFFFFFFFFFE000000;
++			if (virtual_space_start > *startp) {
++				*size = ((virtual_space_start - *startp) + ~0xFFFFFFFFFE000000) & 0xFFFFFFFFFE000000;
++			} else {
++				*size = 0x2000000;
++			}
+ 		} else {
+ 			*startp = gVirtBase & 0xFFFFFFFFFF800000;
+-			*size = ((virtual_space_start - (gVirtBase & 0xFFFFFFFFFF800000)) + ~0xFFFFFFFFFF800000) & 0xFFFFFFFFFF800000;
++			if (virtual_space_start > *startp) {
++				*size = ((virtual_space_start - *startp) + ~0xFFFFFFFFFF800000) & 0xFFFFFFFFFF800000;
++			} else {
++				*size = 0x800000;
++			}
+ 		}
+ 		ret = TRUE;
+ 	}
+@@ -2539,7 +2547,11 @@ pmap_virtual_region(
+ 
+ 	if (((gVirtBase & low_global_vr_mask) != LOW_GLOBAL_BASE_ADDRESS) && (region_select == 2)) {
+ 		*startp = LOW_GLOBAL_BASE_ADDRESS;
+-		*size = low_global_vr_size;
++		if ((gVirtBase & low_global_vr_mask) > LOW_GLOBAL_BASE_ADDRESS) {
++			*size = (gVirtBase & low_global_vr_mask) - LOW_GLOBAL_BASE_ADDRESS;
++		} else {
++			*size = low_global_vr_size;
++		}
+ 		ret = TRUE;
+ 	}
+ 
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+index e5a6f9f..9ef5e6d 100644
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -8164,6 +8164,12 @@ vm_map_delete(
+ 				 * keep going.
+ 				 */
+ 			} else if (state & VMDS_KERNEL_PMAP) {
++#if defined(SWEET)
++				if (startup_phase < STARTUP_SUB_ZALLOC) {
++					state |= VMDS_FOUND_GAP;
++					gap_start = s;
++				} else
++#endif
+ 				__vm_map_delete_gap_panic(map, s, start, end);
+ 			} else if (s < end) {
+ 				state |= VMDS_FOUND_GAP;
+-- 
+2.39.5
