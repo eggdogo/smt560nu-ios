@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eggdogo <eggdogo@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:30:00 -0500
+Subject: [PATCH] sweet: disable kmem claim shuffling and readjusting on 39-bit VA space
+
+On SWEET (Cortex-A53 / MSM8916), the kernel address space is 39 bits
+(112 GB total, of which 64 GB is reserved below LOW_GLOBAL_BASE_ADDRESS,
+leaving only ~48 GB for kernel_map heap and submaps).
+The total size of all registered claims (zones 8GB, compressor 8GB,
+kmem_ptr_range 7.8GB, kmem_data_range 22GB, and fixed submaps) fills ~47 GB,
+leaving less than 1 GB of margin.
+
+When kmem_shuffle_claims() shuffles claims into a random order, if 'zones'
+is shuffled late, its start address exceeds zone_restricted_va_max()
+(32GB from KERNEL_PMAP_HEAP_RANGE_START due to C_SLOT_PACKED_PTR).
+This triggers kmem_readjust_ranges(), which shifts claims by 8 GB to the
+right without resetting the linear 'start' search offset, causing subsequent
+large claims (such as kmem_ptr_range) to exceed VM_MAX_KERNEL_ADDRESS and
+panic with:
+  'kmem_range_init: vm_map_locate_space failing for claim kmem_ptr_range'
+
+Disable kmem_shuffle_claims() and kmem_readjust_ranges() on SWEET so that
+claims are allocated deterministically in their natural registration order,
+where 'zones' is placed at ~0xfffffff011800000 (well within its 32GB bound)
+and all submaps fit cleanly without overflow.
+---
+ osfmk/vm/vm_kern.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..866a2ce 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3630,7 +3630,9 @@ kmem_scramble_ranges(void)
+ 	 * Shuffle registered claims
+ 	 */
+ 	assert(kmem_claim_count < UINT16_MAX);
++#if !defined(SWEET)
+ 	kmem_shuffle_claims();
++#endif
+ 
+ 	/*
+ 	 * Apply restrictions and determine range for each claim
+@@ -3650,7 +3652,9 @@ kmem_scramble_ranges(void)
+ 		 * Re-adjust ranges if restriction not met
+ 		 */
+ 		if (sp_range->min_address && start > sp_range->min_address) {
++#if !defined(SWEET)
+ 			kmem_readjust_ranges(i);
++#endif
+ 		} else {
+ 			sp_range->min_address = start;
+ 			sp_range->max_address = end;
+-- 
+2.39.5
