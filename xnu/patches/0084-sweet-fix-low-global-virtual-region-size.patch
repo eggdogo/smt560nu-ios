@@ -71,7 +71,7 @@ index e5a6f9f..9ef5e6d 100644
  				 * keep going.
  				 */
  			} else if (state & VMDS_KERNEL_PMAP) {
-+#if defined(SWEET)
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
 +				if (startup_phase < STARTUP_SUB_ZALLOC) {
 +					state |= VMDS_FOUND_GAP;
 +					gap_start = s;

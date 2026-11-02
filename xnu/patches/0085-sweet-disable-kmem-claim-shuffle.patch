@@ -35,7 +35,7 @@ index 54edb01..866a2ce 100644
  	 * Shuffle registered claims
  	 */
  	assert(kmem_claim_count < UINT16_MAX);
-+#if !defined(SWEET)
++#if !defined(SWEET) && !defined(ARM64_BOARD_CONFIG_SWEET)
  	kmem_shuffle_claims();
 +#endif
  
@@ -45,7 +45,7 @@ index 54edb01..866a2ce 100644
  		 * Re-adjust ranges if restriction not met
  		 */
  		if (sp_range->min_address && start > sp_range->min_address) {
-+#if !defined(SWEET)
++#if !defined(SWEET) && !defined(ARM64_BOARD_CONFIG_SWEET)
  			kmem_readjust_ranges(i);
 +#endif
  		} else {
