@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eggdogo <eggdogo@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:00 -0500
+Subject: [PATCH] sweet: reduce ZONE_MAP_VA_SIZE to 8GB for 39-bit VA space
+
+On ARMv8.0 devices with 39-bit VA space without ARM_LARGE_MEMORY (such as
+MSM8916 / Cortex-A53), the entire kernel_map VA size is 112 GB
+(from 0xffffffe000000000 to 0xfffffffbffffffff).
+The default macOS ZONE_MAP_VA_SIZE is 128 GB, which exceeds the total
+kernel_map size and panics in kmem_range_init() (vm_map_locate_space
+failing for claim zones).
+Reduce ZONE_MAP_VA_SIZE to 8 GB on SWEET so all kernel zone submaps
+and metadata fit comfortably in the 39-bit kernel address space.
+---
+ osfmk/kern/zalloc.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 2351abc..9872def 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -162,7 +162,12 @@
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
++#if defined(SWEET)
++#define ZONE_MAP_MAX            (1ULL << 30)
++#define ZONE_MAP_VA_SIZE        (8ULL << 30)
++#elif XNU_PLATFORM_MacOSX
+-#if XNU_PLATFORM_MacOSX
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+ #endif /* !XNU_PLATFORM_MacOSX */
+-- 
+2.39.5
+

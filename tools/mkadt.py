@@ -15,7 +15,7 @@ import adt  # noqa: E402
 # and continuous splash FB (0x8e000000).
 # Free contiguous RAM starts safely at 0x90000000 through 0xdf000000 (~1.25 GB).
 PHYS_BASE = 0x90000000
-MEM_SIZE  = 0x4f000000   # ~1.25 GB available, below 1 MB panic log
+MEM_SIZE  = 0x20000000   # ~1.25 GB available, below 1 MB panic log
 PANIC_LOG_SIZE = 0x100000
 
 # MSM8916 Hardware MMIO addresses
@@ -73,7 +73,6 @@ def build(target='ipad'):
         ('dram-size', u64(mem_size)),
         ('random-seed', os.urandom(64)),
         ('debug-enabled', u32(1)),
-        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr('lk2nd-gtel-shim')),
         ('system-firmware-version', cstr('lk2nd-gtel-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
@@ -143,11 +142,11 @@ def build(target='ipad'):
         ])
     ])
 
-    # Framebuffer console node
-    fbcon = node('gtel-fbcon', [
+    # Framebuffer console node (using 600x4 = 2400 stride mapping for 24bpp scanline alignment)
+    fbcon = node('sweet-fbcon', [
         ph(),
         ('reg', u64(FB_BASE, FB_SIZE)),
-        ('width', u32(FB_W)),
+        ('width', u32(600)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
     ])
@@ -161,7 +160,6 @@ def build(target='ipad'):
     ])
 
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
-    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
     # Target identity: default iPad mini 2 (iPad4,4 / J85AP) or iPhone 6 (iPhone7,2 / N61AP)
     if target == 'iphone':
@@ -182,7 +180,7 @@ def build(target='ipad'):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram])
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons])
 
 
 if __name__ == '__main__':
