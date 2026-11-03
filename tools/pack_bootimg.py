@@ -62,5 +62,7 @@ if __name__ == '__main__':
     p.add_argument('--out', required=True)
     p.add_argument('--cmdline', default='console=null')
     p.add_argument('--base', type=lambda x: int(x, 0), default=0x80000000)
+    p.add_argument('--ramdisk-offset', type=lambda x: int(x, 0), default=0x02000000)
     args = p.parse_args()
-    pack_bootimg(args.kernel, args.ramdisk, args.out, cmdline=args.cmdline, base=args.base, dtb_path=args.dtb)
+    pack_bootimg(args.kernel, args.ramdisk, args.out, cmdline=args.cmdline, base=args.base,
+                 ramdisk_offset=args.ramdisk_offset, dtb_path=args.dtb)

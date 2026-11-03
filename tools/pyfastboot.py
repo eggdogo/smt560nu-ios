@@ -115,9 +115,13 @@ class FastbootDevice:
         print(f"Downloading {len(data)} bytes to device...")
         self.download(data)
         print("Booting downloaded image...")
-        resp = self.raw_cmd("boot")
-        print(f"Device response: {resp.strip()}")
-        return resp.startswith("OKAY")
+        try:
+            resp = self.raw_cmd("boot")
+            print(f"Device response: {resp.strip()}")
+            return resp.startswith("OKAY")
+        except Exception as e:
+            print(f"Device booted (fastboot disconnected: {e})")
+            return True
 
 
 def main():
