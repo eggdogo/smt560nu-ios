@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/IOStartIOKit.cpp
 +++ b/iokit/Kernel/IOStartIOKit.cpp
-@@ -78,7 +78,7 @@
+@@ -80,7 +80,7 @@
  	t.tv_nsec = 0;
  
  // RTC is not present on this target
@@ -11,7 +11,7 @@
  #endif
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -683,7 +683,12 @@
+@@ -685,7 +685,12 @@
  	assert(matching);
  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
  
@@ -25,17 +25,3 @@
  		OSSafeReleaseNULL(service);
  	} else {
  		IOLog("!BSD\n");
-@@ -1037,7 +1042,12 @@
- 
- 	matching = IOService::serviceMatching("IOPlatformExpert");
- 	assert(matching);
--	pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	uint64_t bsdTimeout = 0;
-+#else
-+	uint64_t bsdTimeout = 30ULL * kSecondScale;
-+#endif
-+	if ((service = IOService::waitForMatchingService(matching, bsdTimeout))) {
- 	matching->release();
- 	assert(pe);
- 	// Returns kIOReturnNotPrivileged is the root device is not secure.
