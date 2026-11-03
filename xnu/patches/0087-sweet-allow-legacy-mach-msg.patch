@@ -1,0 +1,13 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -602,6 +602,10 @@
+ static bool
+ mach_msg_legacy_allowed(mach_msg_user_header_t *header)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	(void)header;
++	return true;
++#endif
+ 	struct proc_ro *pro = current_thread_ro()->tro_proc_ro;
+ 	uint32_t platform = pro->p_platform_data.p_platform;
+ 	uint32_t sdk = pro->p_platform_data.p_sdk;
