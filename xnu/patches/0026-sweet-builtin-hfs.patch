@@ -100,7 +100,7 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  	bsd_init_kprintf("calling vfsinit\n");
  	vfsinit();
  
-+#if SWEET_HFS
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET) || SWEET_HFS
 +	/* HFS is built in on SWEET: register it like its kext would, before mounting root. */
 +	extern void sweet_hfs_register(void);
 +	sweet_hfs_register();
