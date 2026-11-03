@@ -1,0 +1,55 @@
+name: pack-bootimg
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "slim_essentials.tar.gz"
+      - ".github/workflows/pack.yml"
+
+jobs:
+  pack:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create HFSX Customer Ramdisk
+        run: |
+          mkdir -p root_mnt root_src
+          tar -xzf slim_essentials.tar.gz -C root_src
+          
+          cd root_src
+          mkdir -p sbin
+          ln -sf ../System/Library/Filesystems/hfs.fs/Contents/Resources/mount_hfs sbin/mount_hfs
+          ln -sf ../System/Library/Filesystems/hfs.fs/Contents/Resources/fsck_hfs sbin/fsck_hfs
+          ln -sf ../System/Library/Filesystems/hfs.fs/Contents/Resources/newfs_hfs sbin/newfs_hfs
+          cd ..
+          
+          hdiutil create -size 22m -fs "Case-sensitive HFS+" -volname root -layout NONE -ov slim_ramdisk.dmg
+          hdiutil attach slim_ramdisk.dmg -mountpoint root_mnt
+          
+          sudo cp -a root_src/. root_mnt/
+          hdiutil detach root_mnt
+          ls -lh slim_ramdisk.dmg
+
+      - name: Pack Payload and Boot Image
+        run: |
+          python3 tools/mkpayload.py kernel.development.sweet gtel.adt payload.bin \
+            --ramdisk slim_ramdisk.dmg \
+            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 gtel_fbcon=1 rd=md0"
+          
+          python3 tools/pack_bootimg.py \
+            --kernel shim/out/Image \
+            --ramdisk payload.bin \
+            --cmdline "console=null" \
+            --out shim-boot.img
+          
+          ls -lh shim-boot.img
+
+      - name: Upload Boot Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-boot-hfs
+          path: |
+            shim-boot.img
+            slim_ramdisk.dmg
