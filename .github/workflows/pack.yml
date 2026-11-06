@@ -36,7 +36,7 @@ jobs:
         run: |
           python3 tools/mkpayload.py kernel.development.sweet gtel.adt payload.bin \
             --ramdisk slim_ramdisk.dmg \
-            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 gtel_fbcon=1 rd=md0"
+            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 gtel_fbcon=1 rd=md0 cs_enforcement_disable=1 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1 unentitled_ios_sim_launch=1 allow_legacy_mach_msg=1 -disable_aslr sweetsample=launchd"
           
           python3 tools/pack_bootimg.py \
             --kernel shim/out/Image \
