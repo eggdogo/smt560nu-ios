@@ -12,10 +12,10 @@ index 6630131..9730cab 100644
  bsd/dev/sweet_rpmh.c			standard
 diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 new file mode 100755
-index 0000000..5703fcd
+index 0000000..376000b
 --- /dev/null
 +++ b/bsd/dev/gtel_sdhci.c
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,497 @@
 +/*
 + * gtel eMMC probe: MSM8916 SDHCI1 (SM-T560NU internal eMMC), read-only.
 + *
@@ -115,6 +115,8 @@ index 0000000..5703fcd
 +static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
 +static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
 +
++static void dump_regs(const char *when);
++
 +/* Poll until (reg & mask) == want, 10 us steps; false on timeout */
 +static bool
 +wait32(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeout_ms)
@@ -205,6 +207,7 @@ index 0000000..5703fcd
 +	uint32_t st = rd32(hc, SDHCI_INT_STATUS);
 +	if (!(st & done) || (st & INT_ERROR)) {
 +		printf("gtel mmc: CMD%u arg 0x%x failed: INT=0x%08x\n", idx, arg, rd32(hc, SDHCI_INT_STATUS));
++		dump_regs("after failed command");
 +		sdhci_reset_lines();
 +		return EIO;
 +	}
@@ -213,9 +216,13 @@ index 0000000..5703fcd
 +	}
 +	wr32(hc, SDHCI_INT_STATUS, INT_CMD_DONE | INT_XFER_DONE);
 +	/* R1b: the card holds DAT0 low while busy */
-+	if ((flags & 3) == CMD_RESP_48_BUSY && !wait32(SDHCI_PRESENT_STATE, PRES_DAT_INHIBIT, 0, 1000)) {
-+		printf("gtel mmc: CMD%u: card stayed busy\n", idx);
-+		return ETIMEDOUT;
++	if ((flags & 3) == CMD_RESP_48_BUSY) {
++		if (!wait32(SDHCI_PRESENT_STATE, PRES_DAT_INHIBIT, 0, 1000)) {
++			printf("gtel mmc: CMD%u: card stayed busy\n", idx);
++			return ETIMEDOUT;
++		}
++		/* This host can leave its command state machine half-finished after R1b */
++		sdhci_reset_lines();
 +	}
 +	return 0;
 +}
@@ -297,9 +304,6 @@ index 0000000..5703fcd
 +	}
 +	card_rca = MMC_RCA;
 +	if ((error = mmc_cmd(7, card_rca << 16, CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX, &r))) {
-+		return error;
-+	}
-+	if ((error = mmc_cmd(16, MMC_BLOCK, CMD_RESP_48 | CMD_CRC | CMD_INDEX, &r))) {
 +		return error;
 +	}
 +	sdhci_set_clock_khz(25000);
