@@ -12,10 +12,10 @@ index 6630131..9730cab 100644
  bsd/dev/sweet_rpmh.c			standard
 diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 new file mode 100755
-index 0000000..68b69eb
+index 0000000..5703fcd
 --- /dev/null
 +++ b/bsd/dev/gtel_sdhci.c
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,493 @@
 +/*
 + * gtel eMMC probe: MSM8916 SDHCI1 (SM-T560NU internal eMMC), read-only.
 + *
@@ -194,8 +194,16 @@ index 0000000..68b69eb
 +	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
 +	wr32(hc, SDHCI_ARGUMENT, arg);
 +	wr16(hc, SDHCI_COMMAND, (uint16_t)((idx << 8) | flags));
-+	if (!wait32(SDHCI_INT_STATUS, INT_CMD_DONE | INT_ERROR, INT_CMD_DONE, 1000) &&
-+	    !(rd32(hc, SDHCI_INT_STATUS) & INT_CMD_DONE)) {
++	/*
++	 * For R1b this host may report only transfer-complete (end of busy)
++	 * and never command-complete, so either one finishes the command.
++	 */
++	uint32_t done = INT_CMD_DONE | ((flags & 3) == CMD_RESP_48_BUSY ? INT_XFER_DONE : 0);
++	for (uint32_t i = 0; i < 100000 && !(rd32(hc, SDHCI_INT_STATUS) & (done | INT_ERROR)); i++) {
++		delay(10);
++	}
++	uint32_t st = rd32(hc, SDHCI_INT_STATUS);
++	if (!(st & done) || (st & INT_ERROR)) {
 +		printf("gtel mmc: CMD%u arg 0x%x failed: INT=0x%08x\n", idx, arg, rd32(hc, SDHCI_INT_STATUS));
 +		sdhci_reset_lines();
 +		return EIO;
@@ -203,7 +211,7 @@ index 0000000..68b69eb
 +	if (resp) {
 +		*resp = rd32(hc, SDHCI_RESPONSE);
 +	}
-+	wr32(hc, SDHCI_INT_STATUS, INT_CMD_DONE);
++	wr32(hc, SDHCI_INT_STATUS, INT_CMD_DONE | INT_XFER_DONE);
 +	/* R1b: the card holds DAT0 low while busy */
 +	if ((flags & 3) == CMD_RESP_48_BUSY && !wait32(SDHCI_PRESENT_STATE, PRES_DAT_INHIBIT, 0, 1000)) {
 +		printf("gtel mmc: CMD%u: card stayed busy\n", idx);
