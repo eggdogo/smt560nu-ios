@@ -36,6 +36,9 @@ jobs:
           hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/ios ios_root.dmg
           hdiutil create -size "$IMAGE_SIZE" -type SPARSE -fs "Case-sensitive HFS+" -volname gtelroot -layout NONE gtelroot
           hdiutil attach -owners on -nobrowse -mountpoint /tmp/root gtelroot.sparseimage
+          # keep Spotlight off the new volume, or it holds the detach later
+          sudo mdutil -i off /tmp/root || true
+          sudo touch /tmp/root/.metadata_never_index
           # Everything but the volume's own bookkeeping (".HFS+ Private Directory Data\r"
           # holds hard-link targets; ditto cannot recreate it and copies the links' data anyway)
           for e in /tmp/ios/* /tmp/ios/.[!.]*; do
@@ -73,7 +76,12 @@ jobs:
 
       - name: Raw image, zstd
         run: |
-          hdiutil detach /tmp/root
+          sync
+          for i in 1 2 3 4 5; do
+            hdiutil detach -force /tmp/root && break
+            sleep 10
+          done
+          test ! -d /tmp/root/sbin
           brew install zstd
           DEV=$(hdiutil attach -nomount -noverify gtelroot.sparseimage | awk 'NR==1{print $1}')
           echo "device $DEV"
