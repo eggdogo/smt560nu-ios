@@ -12,10 +12,10 @@ index 6630131..9730cab 100644
  bsd/dev/sweet_rpmh.c			standard
 diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 new file mode 100755
-index 0000000..abe8efa
+index 0000000..68b69eb
 --- /dev/null
 +++ b/bsd/dev/gtel_sdhci.c
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,485 @@
 +/*
 + * gtel eMMC probe: MSM8916 SDHCI1 (SM-T560NU internal eMMC), read-only.
 + *
@@ -94,7 +94,13 @@ index 0000000..abe8efa
 +#define SDHCI_INT_ENABLE        0x34
 +#define SDHCI_SIGNAL_ENABLE     0x38
 +#define SDHCI_CAPABILITIES      0x40
++#define SDHCI_HOST_CONTROL2     0x3e
 +#define SDHCI_HOST_VERSION      0xfe
++
++#define CMD_RESP_136            0x01
++#define MMC_OCR_REQ             0x40ff8080u     /* sector mode, 1.7-3.6 V */
++#define MMC_RCA                 2u
++#define BASE_CLK_KHZ            200000u         /* CAPS base clock field */
 +
 +#define MMC_BLOCK               512u
 +#define GPT_MAX_ENTRIES         128u
@@ -221,6 +227,81 @@ index 0000000..abe8efa
 +	return error;
 +}
 +
++/* SD clock = base / (2 * div), div 0 = base; SDHCI v3 10-bit divider */
++static void
++sdhci_set_clock_khz(uint32_t khz)
++{
++	uint32_t div = (BASE_CLK_KHZ + 2 * khz - 1) / (2 * khz);
++	if (div > 0x3ff) {
++		div = 0x3ff;
++	}
++	uint16_t clk = rd16(hc, SDHCI_CLOCK_CONTROL);
++	wr16(hc, SDHCI_CLOCK_CONTROL, (uint16_t)(clk & ~CLK_SD_EN));
++	clk = (uint16_t)(((div & 0xff) << 8) | ((div >> 8) << 6) | CLK_INT_EN);
++	wr16(hc, SDHCI_CLOCK_CONTROL, clk);
++	for (int i = 0; i < 2000 && !(rd16(hc, SDHCI_CLOCK_CONTROL) & CLK_INT_STABLE); i++) {
++		delay(10);
++	}
++	wr16(hc, SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_SD_EN));
++	delay(1000);
++	printf("gtel mmc: clock %u kHz (div %u), CLK=0x%04x\n", BASE_CLK_KHZ / (2 * div), div,
++	    rd16(hc, SDHCI_CLOCK_CONTROL));
++}
++
++/*
++ * eMMC power-on identification (JEDEC 84 6.4): works whatever state lk2nd
++ * left the card in, including sleep, since CMD0 is accepted there. 1-bit
++ * bus, legacy timing, 400 kHz, then 25 MHz once selected.
++ */
++static int
++mmc_identify(void)
++{
++	uint32_t r = 0, state = 0;
++	int error;
++
++	wr8(hc, SDHCI_HOST_CONTROL, (uint8_t)(rd8(hc, SDHCI_HOST_CONTROL) & ~0x26u));   /* 1-bit, no HS */
++	wr16(hc, SDHCI_HOST_CONTROL2, (uint16_t)(rd16(hc, SDHCI_HOST_CONTROL2) & ~0x7u)); /* no UHS mode */
++	sdhci_set_clock_khz(400);
++
++	(void)mmc_cmd(0, 0, CMD_RESP_NONE, NULL);
++	delay(1000);
++
++	for (int i = 0; i < 1000; i++) {
++		if ((error = mmc_cmd(1, MMC_OCR_REQ, CMD_RESP_48, &r))) {
++			return error;
++		}
++		if (r & 0x80000000u) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("gtel mmc: CMD1 OCR 0x%08x (%s)\n", r, (r & 0x80000000u) ? "ready" : "still busy");
++	if (!(r & 0x80000000u)) {
++		return ETIMEDOUT;
++	}
++	if ((error = mmc_cmd(2, 0, CMD_RESP_136 | CMD_CRC, NULL))) {
++		return error;
++	}
++	printf("gtel mmc: CID %08x %08x %08x %08x\n", rd32(hc, SDHCI_RESPONSE + 12),
++	    rd32(hc, SDHCI_RESPONSE + 8), rd32(hc, SDHCI_RESPONSE + 4), rd32(hc, SDHCI_RESPONSE));
++	if ((error = mmc_cmd(3, MMC_RCA << 16, CMD_RESP_48 | CMD_CRC | CMD_INDEX, &r))) {
++		return error;
++	}
++	card_rca = MMC_RCA;
++	if ((error = mmc_cmd(7, card_rca << 16, CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX, &r))) {
++		return error;
++	}
++	if ((error = mmc_cmd(16, MMC_BLOCK, CMD_RESP_48 | CMD_CRC | CMD_INDEX, &r))) {
++		return error;
++	}
++	sdhci_set_clock_khz(25000);
++	if ((error = mmc_status(card_rca, &state))) {
++		return error;
++	}
++	printf("gtel mmc: identified, RCA %u, state %s\n", card_rca, state < 11 ? mmc_states[state] : "?");
++	return state == 4 ? 0 : EIO;
++}
++
 +/* Bring the card lk2nd left behind to the transfer state */
 +static int
 +mmc_wake(void)
@@ -229,7 +310,7 @@ index 0000000..abe8efa
 +	int error = ENODEV;
 +
 +	/* CAF LK uses RCA 2 for eMMC; try the others in case lk2nd differs */
-+	static const uint32_t rcas[] = { 2, 1, 3 };
++	static const uint32_t rcas[] = { 2 };
 +	for (unsigned i = 0; i < sizeof(rcas) / sizeof(rcas[0]); i++) {
 +		if (!(error = mmc_status(rcas[i], &state))) {
 +			card_rca = rcas[i];
@@ -237,13 +318,7 @@ index 0000000..abe8efa
 +		}
 +	}
 +	if (error) {
-+		/* A sleeping card ignores CMD13; wake RCA 2 blindly and retry */
-+		printf("gtel mmc: no answer to CMD13, trying CMD5 awake\n");
-+		card_rca = 2;
-+		(void)mmc_cmd(5, card_rca << 16, CMD_RESP_48_BUSY, &r);
-+		if ((error = mmc_status(card_rca, &state))) {
-+			return error;
-+		}
++		return error;
 +	}
 +	printf("gtel mmc: RCA %u, state %s\n", card_rca, state < 11 ? mmc_states[state] : "?");
 +
@@ -398,6 +473,11 @@ index 0000000..abe8efa
 +	dump_regs("SDHCI mode on");
 +
 +	int error = mmc_wake();
++	if (error) {
++		printf("gtel mmc: resuming lk2nd's session failed (%d), re-identifying the card\n", error);
++		sdhci_reset_lines();
++		error = mmc_identify();
++	}
 +	if (error) {
 +		printf("gtel mmc: card not in transfer state (%d), giving up\n", error);
 +		return;
