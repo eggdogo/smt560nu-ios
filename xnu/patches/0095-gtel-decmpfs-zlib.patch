@@ -1,0 +1,246 @@
+diff --git a/bsd/kern/decmpfs.c b/bsd/kern/decmpfs.c
+index ff8c5e3..96120a4 100644
+--- a/bsd/kern/decmpfs.c
++++ b/bsd/kern/decmpfs.c
+@@ -2349,6 +2349,228 @@ SECURITY_READ_ONLY_EARLY(static decmpfs_registration) Type1Reg =
+ 
+ #pragma mark --- decmpfs initialization ---
+ 
++
++#if defined(SWEET)
++/*
++ * gtel: the iOS root filesystem stores most of its files HFS-compressed
++ * (zlib, types 3 and 4). On a real device AppleFSCompressionTypeZlib.kext
++ * handles them; we have no kexts, so decode them here with libkern's zlib.
++ *   type 3: zlib stream (or 0xff + raw bytes) right after the xattr header
++ *   type 4: resource fork: 256-byte header, then at data_off a BE length,
++ *           a LE block count and (LE off, LE len) pairs relative to
++ *           data_off + 4; each block holds 64 KiB of output
++ */
++#include <libkern/zlib.h>
++
++#define GTEL_CMP_BLOCK 65536
++
++static voidpf
++gtel_zalloc(__unused voidpf opaque, uInt items, uInt size)
++{
++	size_t n = (size_t)items * size + 16;
++	uint64_t *p = kalloc_data(n, Z_WAITOK | Z_ZERO);
++	if (!p) {
++		return Z_NULL;
++	}
++	p[0] = n;
++	return p + 2;
++}
++
++static void
++gtel_zfree(__unused voidpf opaque, voidpf ptr)
++{
++	uint64_t *p = (uint64_t *)ptr - 2;
++	kfree_data(p, p[0]);
++}
++
++/* decode one stored-or-zlib block; returns bytes produced or -1 */
++static int64_t
++gtel_unblock(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen)
++{
++	if (inlen == 0) {
++		return -1;
++	}
++	if ((in[0] & 0x0f) == 0x0f) {
++		size_t n = MIN(inlen - 1, outlen);
++		memcpy(out, in + 1, n);
++		return (int64_t)n;
++	}
++	z_stream zs;
++	bzero(&zs, sizeof(zs));
++	zs.zalloc = gtel_zalloc;
++	zs.zfree = gtel_zfree;
++	zs.next_in = (Bytef *)(uintptr_t)in;
++	zs.avail_in = (uInt)inlen;
++	zs.next_out = out;
++	zs.avail_out = (uInt)outlen;
++	if (inflateInit(&zs) != Z_OK) {
++		return -1;
++	}
++	int r = inflate(&zs, Z_FINISH);
++	int64_t got = (int64_t)(outlen - zs.avail_out);
++	inflateEnd(&zs);
++	if (r != Z_STREAM_END && r != Z_OK && r != Z_BUF_ERROR) {
++		printf("SWEET decmpfs: inflate err %d\n", r);
++		return -1;
++	}
++	return got;
++}
++
++/* copy decoded bytes [boff, boff+blen) of the file into the vectors */
++static void
++gtel_scatter(const uint8_t *src, off_t srcoff, size_t srclen, off_t offset, int nvec, decmpfs_vector *vec)
++{
++	off_t pos = offset;
++	for (int i = 0; i < nvec; i++) {
++		off_t vs = pos, ve = pos + vec[i].size;
++		off_t s = MAX(vs, srcoff), e = MIN(ve, srcoff + (off_t)srclen);
++		if (s < e) {
++			memcpy((uint8_t *)vec[i].buf + (s - vs), src + (s - srcoff), (size_t)(e - s));
++		}
++		pos = ve;
++	}
++}
++
++static int
++gtel_rsrc_read(vnode_t vp, vfs_context_t ctx, off_t off, void *buf, size_t len)
++{
++	uio_t uio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++	if (!uio) {
++		return ENOMEM;
++	}
++	uio_addiov(uio, CAST_USER_ADDR_T(buf), len);
++	size_t sz = 0;
++	int err = vn_getxattr(vp, XATTR_RESOURCEFORK_NAME, uio, &sz, XATTR_NOSECURITY, ctx);
++	if (!err && uio_resid(uio) != 0) {
++		err = EIO;
++	}
++	uio_free(uio);
++	return err;
++}
++
++static int
++gtel_validate_zlib(__unused vnode_t vp, __unused vfs_context_t ctx, __unused decmpfs_header *hdr)
++{
++	return 0;
++}
++
++static int
++gtel_fetch_type3(__unused vnode_t vp, __unused vfs_context_t ctx, decmpfs_header *hdr, off_t offset, user_ssize_t size, int nvec, decmpfs_vector *vec, uint64_t *bytes_read)
++{
++	uint64_t usize = hdr->uncompressed_size;
++	if (usize > 16 * 1024 * 1024 || hdr->attr_size < sizeof(decmpfs_disk_header)) {
++		return EINVAL;
++	}
++	if ((uint64_t)offset >= usize) {
++		*bytes_read = 0;
++		return 0;
++	}
++	size_t alloc = MAX(usize, 1);
++	uint8_t *out = kalloc_data(alloc, Z_WAITOK);
++	if (!out) {
++		return ENOMEM;
++	}
++	int64_t got = gtel_unblock(hdr->attr_bytes, hdr->attr_size - sizeof(decmpfs_disk_header), out, usize);
++	if (got < 0) {
++		kfree_data(out, alloc);
++		return EIO;
++	}
++	user_ssize_t want = MIN(size, (user_ssize_t)(usize - offset));
++	gtel_scatter(out, 0, (size_t)got, offset, nvec, vec);
++	kfree_data(out, alloc);
++	if (bytes_read) {
++		*bytes_read = (uint64_t)want;
++	}
++	return 0;
++}
++
++static int
++gtel_fetch_type4(vnode_t vp, vfs_context_t ctx, decmpfs_header *hdr, off_t offset, user_ssize_t size, int nvec, decmpfs_vector *vec, uint64_t *bytes_read)
++{
++	uint64_t usize = hdr->uncompressed_size;
++	int err = 0;
++	if ((uint64_t)offset >= usize) {
++		*bytes_read = 0;
++		return 0;
++	}
++	user_ssize_t want = MIN(size, (user_ssize_t)(usize - offset));
++
++	uint8_t rh[4];
++	if ((err = gtel_rsrc_read(vp, ctx, 0, rh, 4))) {
++		printf("SWEET decmpfs: rsrc header read err %d\n", err);
++		return err;
++	}
++	off_t data_off = ((uint32_t)rh[0] << 24) | (rh[1] << 16) | (rh[2] << 8) | rh[3];
++	uint32_t nblocks = (uint32_t)((usize + GTEL_CMP_BLOCK - 1) / GTEL_CMP_BLOCK);
++	uint32_t first = (uint32_t)(offset / GTEL_CMP_BLOCK);
++	uint32_t last = (uint32_t)((offset + want - 1) / GTEL_CMP_BLOCK);
++	if (last >= nblocks) {
++		return EINVAL;
++	}
++
++	uint8_t *out = kalloc_data(GTEL_CMP_BLOCK, Z_WAITOK);
++	uint8_t *in = kalloc_data(GTEL_CMP_BLOCK + 1024, Z_WAITOK);
++	if (!out || !in) {
++		err = ENOMEM;
++		goto done;
++	}
++	for (uint32_t b = first; b <= last; b++) {
++		uint32_t ent[2];
++		if ((err = gtel_rsrc_read(vp, ctx, data_off + 8 + 8 * (off_t)b, ent, 8))) {
++			goto done;
++		}
++		uint32_t boff = OSSwapLittleToHostInt32(ent[0]);
++		uint32_t blen = OSSwapLittleToHostInt32(ent[1]);
++		if (blen > GTEL_CMP_BLOCK + 1024) {
++			err = EINVAL;
++			goto done;
++		}
++		if ((err = gtel_rsrc_read(vp, ctx, data_off + 4 + boff, in, blen))) {
++			goto done;
++		}
++		size_t bout = (size_t)MIN((uint64_t)GTEL_CMP_BLOCK, usize - (uint64_t)b * GTEL_CMP_BLOCK);
++		int64_t got = gtel_unblock(in, blen, out, bout);
++		if (got < 0) {
++			err = EIO;
++			goto done;
++		}
++		gtel_scatter(out, (off_t)b * GTEL_CMP_BLOCK, (size_t)got, offset, nvec, vec);
++	}
++	if (bytes_read) {
++		*bytes_read = (uint64_t)want;
++	}
++done:
++	if (out) {
++		kfree_data(out, GTEL_CMP_BLOCK);
++	}
++	if (in) {
++		kfree_data(in, GTEL_CMP_BLOCK + 1024);
++	}
++	if (err) {
++		printf("SWEET decmpfs: type4 fetch err %d at %lld\n", err, (long long)offset);
++	}
++	return err;
++}
++
++static const decmpfs_registration gtel_zlib3_reg = {
++	.decmpfs_registration = DECMPFS_REGISTRATION_VERSION,
++	.validate             = gtel_validate_zlib,
++	.adjust_fetch         = NULL,
++	.fetch                = gtel_fetch_type3,
++	.free_data            = NULL,
++	.get_flags            = NULL,
++};
++
++static const decmpfs_registration gtel_zlib4_reg = {
++	.decmpfs_registration = DECMPFS_REGISTRATION_VERSION,
++	.validate             = gtel_validate_zlib,
++	.adjust_fetch         = NULL,
++	.fetch                = gtel_fetch_type4,
++	.free_data            = NULL,
++	.get_flags            = NULL,
++};
++#endif /* SWEET */
++
+ void
+ decmpfs_init(void)
+ {
+@@ -2360,6 +2582,12 @@ decmpfs_init(void)
+ 	decmpfs_ctx = vfs_context_create(vfs_context_kernel());
+ 
+ 	register_decmpfs_decompressor(CMP_Type1, &Type1Reg);
++#if defined(SWEET)
++	register_decmpfs_decompressor(3, &gtel_zlib3_reg);
++	register_decmpfs_decompressor(4, &gtel_zlib4_reg);
++	printf("SWEET decmpfs: zlib types 3/4 registered
++");
++#endif
+ 
+ 	ktriage_register_subsystem_strings(KDBG_TRIAGE_SUBSYS_DECMPFS, &ktriage_decmpfs_subsystem_strings);
+ 
