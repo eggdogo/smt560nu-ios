@@ -12,10 +12,38 @@ index 422873e..ab3e55f 100644
  #if CONFIG_MEMORYSTATUS
  440	AUE_NULL	ALL	{ int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, user_addr_t buffer, size_t buffersize); }
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index 636bd3d..0e1f0e1 100644
+index 636bd3d..521cdb9 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -3002,6 +3002,76 @@ done:
+@@ -2223,6 +2223,11 @@ static void shared_region_map_and_slide_cleanup(
+  * It had to be broken out of _shared_region_map_and_slide() to
+  * prevent compiler inlining from blowing out the stack.
+  */
++#if defined(SWEET)
++/* Require SF_RESTRICTED on the shared cache file (off: see below) */
++static int sweet_sr_require_sip = 0;
++#endif
++
+ __attribute__((noinline))
+ static int
+ shared_region_map_and_slide_setup(
+@@ -2509,7 +2514,15 @@ after_root_check:
+ #endif /* XNU_TARGET_OS_OSX && defined(__arm64__) */
+ 
+ #if CONFIG_CSR
++		/*
++		 * gtel: the cache was copied from the iOS APFS root into HFS+ and
++		 * lost SF_RESTRICTED; there is no SIP on this port to honour.
++		 */
++#if defined(SWEET)
++		if (sweet_sr_require_sip && csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0) {
++#else
+ 		if (csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0) {
++#endif
+ 			VATTR_INIT(&va);
+ 			VATTR_WANTED(&va, va_flags);
+ 			error = vnode_getattr(srfmp->vp, &va, vfs_context_current());
+@@ -3002,6 +3015,76 @@ done:
  	return kr;
  }
  
