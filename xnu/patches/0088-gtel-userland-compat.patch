@@ -1,0 +1,215 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..9b426ef 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -70,11 +70,11 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 15 * hz);
+ 	}
+ }
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..6c98e25 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3450,7 +3450,19 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 
+ 	if (uap->adesc != USER_ADDR_NULL) {
+ 		if (is_64) {
++#if defined(SWEET)
++			/*
++			 * gtel runs the iOS 12.5.7 userland, whose libsystem_kernel
++			 * passes a 0x60-byte descriptor that ends at persona_info.
++			 * Copying sizeof(px_args) reads the caller's stack into
++			 * posix_cred_info and the spawn fails with ERANGE.
++			 */
++			bzero(&px_args, sizeof(px_args));
++			error = copyin(uap->adesc, &px_args,
++			    offsetof(struct user__posix_spawn_args_desc, posix_cred_info_size));
++#else
+ 			error = copyin(uap->adesc, &px_args, sizeof(px_args));
++#endif
+ 		} else {
+ 			struct user32__posix_spawn_args_desc px_args32;
+ 
+@@ -3488,7 +3500,14 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			 * This is a bit fragile: <rdar://problem/16427422>
+ 			 */
+ 
++#if defined(SWEET)
++			/* iOS 12's struct _posix_spawnattr is 0x90 bytes, ours is longer */
++			bzero(&px_sa, px_sa_offset);
++			if ((error = copyin(px_args.attrp, &px_sa,
++			    MIN(px_args.attr_size, MIN(px_sa_offset, (vm_size_t)0x90)))) != 0) {
++#else
+ 			if ((error = copyin(px_args.attrp, &px_sa, px_sa_offset)) != 0) {
++#endif
+ 				goto bad;
+ 			}
+ 
+@@ -4667,6 +4686,9 @@ bad:
+ 	}
+ 
+ 	assert(exec_failure_reason == NULL);
++#if defined(SWEET)
++	printf("SPAWN err=%d\n", error);
++#endif
+ 	return error;
+ }
+ 
+@@ -6880,6 +6902,11 @@ load_init_program(proc_t p)
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
++#if defined(SWEET)
++	/* sweet starts the sampler from its UFS probe; gtel has no UFS */
++	extern void sweet_sample_start(void);
++	sweet_sample_start();
++#endif
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..b797f79 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1795,9 +1795,20 @@ proc_handle_critical_exit(proc_t p, int rv)
+ 		printf("pid %d exited -- no exit reason available -- (signal %d, exit %d)\n",
+ 		    proc_getpid(p), WTERMSIG(rv), WEXITSTATUS(rv));
+ 	} else {
++#if defined(SWEET)
++		/* A crash's description is rarely useful here; its PC/ESR/FAR is */
++		extern void sweet_user_fault_regs(uint64_t *pc, uint32_t *esr, uint64_t *far);
++		uint64_t upc, ufar;
++		uint32_t uesr;
++		sweet_user_fault_regs(&upc, &uesr, &ufar);
++		printf("pid %d exit ns %d c:0x%llx PC:0x%llx ESR:0x%x FAR:0x%llx\n", proc_getpid(p),
++		    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code, upc, uesr, ufar);
++		(void)exit_reason_desc;
++#else
+ 		printf("pid %d exited -- exit reason namespace %d subcode 0x%llx, description %s\n", proc_getpid(p),
+ 		    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code, exit_reason_desc ?
+ 		    exit_reason_desc : "none");
++#endif
+ 	}
+ 
+ 	const char *prefix_str;
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 407a18b..a58a6d9 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3210,9 +3210,14 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		if (cs_process_enforcement(pt)) {
+ 			retflags |= CS_ENFORCEMENT;
+ 		}
++#if defined(SWEET)
++		/* launchd refuses to manage jobs that do not report as platform */
++		retflags |= CS_PLATFORM_BINARY;
++#else
+ 		if (csproc_get_platform_binary(pt)) {
+ 			retflags |= CS_PLATFORM_BINARY;
+ 		}
++#endif
+ 		if (csproc_get_platform_path(pt)) {
+ 			retflags |= CS_PLATFORM_PATH;
+ 		}
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 1cd8467..f2b3ba4 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -879,6 +879,54 @@ sleh_synchronous(arm_context_t *context, uint32_t esr, vm_offset_t far)
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+  */
++#if defined(SWEET)
++/*
++ * The iOS 12 userland reads a few system registers that trap from EL0 on
++ * Cortex-A53 under this kernel's configuration. Emulate the reads so the
++ * process continues instead of taking EXC_BAD_INSTRUCTION.
++ */
++static bool
++sweet_emulate_el0_mrs(arm_saved_state_t *state, uint32_t instr)
++{
++	uint64_t pc = get_saved_state_pc(state);
++	unsigned rt = instr & 0x1f;
++	uint64_t val;
++
++	printf("EMU PC:0x%llx INS:0x%08x\n", pc, instr);
++
++	if (pc == 0x1100a6624ULL) {
++		/* libsystem_kernel's TSD read in the shared cache, which lands in x10 */
++		val = __builtin_arm_rsr64("TPIDRRO_EL0");
++		rt = 10;
++	} else {
++		switch (instr & ~0x1fU) {
++		case 0xd53bd060: val = __builtin_arm_rsr64("TPIDRRO_EL0"); break;
++		case 0xd53bd040: val = __builtin_arm_rsr64("TPIDR_EL0"); break;
++		case 0xd5380020: val = __builtin_arm_rsr64("S3_0_C0_C0_1"); break;
++		case 0xd53be040: val = __builtin_arm_rsr64("CNTVCT_EL0"); break;
++		case 0xd53be000: val = __builtin_arm_rsr64("CNTFRQ_EL0"); break;
++		default: return false;
++		}
++	}
++	if (rt != 31) {
++		set_saved_state_reg(state, rt, val);
++	}
++	add_saved_state_pc(state, 4);
++	return true;
++}
++
++/* For the exit log in proc_prepareexit (BSD cannot see arm_saved_state) */
++void sweet_user_fault_regs(uint64_t *pc, uint32_t *esr, uint64_t *far);
++void
++sweet_user_fault_regs(uint64_t *pc, uint32_t *esr, uint64_t *far)
++{
++	arm_saved_state_t *state = get_user_regs(current_thread());
++	*pc = state ? get_saved_state_pc(state) : 0;
++	*esr = state ? (uint32_t)get_saved_state_esr(state) : 0;
++	*far = state ? get_saved_state_far(state) : 0;
++}
++#endif /* SWEET */
++
+ static void
+ handle_uncategorized(arm_saved_state_t *state)
+ {
+@@ -889,6 +937,12 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(SWEET)
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_el0_mrs(state, instr)) {
++		return;
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 67c5f79..dd11c40 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -612,6 +612,15 @@ task_set_platform_binary(
+ boolean_t
+ task_get_platform_binary(task_t task)
+ {
++#if defined(SWEET)
++	/*
++	 * The iOS 12 binaries are not in any trust cache, so nothing is a
++	 * real platform binary; answering "no" keeps launchd's shared-region
++	 * and legacy mach_msg paths on the ones it expects.
++	 */
++	(void)task;
++	return FALSE;
++#endif
+ 	return (task_ro_flags_get(task) & TFRO_PLATFORM) != 0;
+ }
+ 
