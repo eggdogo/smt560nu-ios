@@ -40,11 +40,16 @@ jobs:
           # holds hard-link targets; ditto cannot recreate it and copies the links' data anyway)
           for e in /tmp/ios/* /tmp/ios/.[!.]*; do
             case "$(basename "$e")" in .HFS+\ Private*|.fseventsd|.Trashes|.Spotlight-V100) continue;; esac
-            sudo ditto --nohfsCompression "$e" "/tmp/root/$(basename "$e")"
+            if [ -L "$e" ]; then
+              # etc, tmp, var -> private/...: keep them links, not copies of the target
+              sudo ln -s "$(readlink "$e")" "/tmp/root/$(basename "$e")"
+            else
+              sudo ditto --nohfsCompression "$e" "/tmp/root/$(basename "$e")"
+            fi
           done
           ls -la /tmp/root
-          test -x /tmp/root/sbin/launchd
-          du -sh /tmp/root
+          test -L /tmp/root/var && test -x /tmp/root/sbin/launchd
+          sudo du -sh /tmp/root
           hdiutil detach /tmp/ios
           rm ios_root.dmg
 
