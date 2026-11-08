@@ -12,10 +12,10 @@ index 6630131..9730cab 100644
  bsd/dev/sweet_rpmh.c			standard
 diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 new file mode 100755
-index 0000000..7348509
+index 0000000..abe8efa
 --- /dev/null
 +++ b/bsd/dev/gtel_sdhci.c
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,405 @@
 +/*
 + * gtel eMMC probe: MSM8916 SDHCI1 (SM-T560NU internal eMMC), read-only.
 + *
@@ -45,6 +45,17 @@ index 0000000..7348509
 +#define SDHC1_CORE_PA           0x07824000
 +
 +#define CORE_HC_MODE            0x78
++/* Power IRQ handshake (sdhci-msm v1 core registers) */
++#define CORE_PWRCTL_STATUS      0xdc
++#define CORE_PWRCTL_MASK        0xe0
++#define CORE_PWRCTL_CLEAR       0xe4
++#define CORE_PWRCTL_CTL         0xe8
++#define  PWRCTL_BUS_OFF         (1u << 0)
++#define  PWRCTL_BUS_ON          (1u << 1)
++#define  PWRCTL_IO_LOW          (1u << 2)
++#define  PWRCTL_IO_HIGH         (1u << 3)
++#define  PWRCTL_BUS_SUCCESS     (1u << 0)
++#define  PWRCTL_IO_SUCCESS      (1u << 2)
 +#define  HC_MODE_EN             (1u << 0)
 +#define  FF_CLK_SW_RST_DIS      (1u << 13)
 +
@@ -123,10 +134,42 @@ index 0000000..7348509
 +static void
 +dump_regs(const char *when)
 +{
-+	printf("gtel mmc: %s: HC_MODE=0x%x PRES=0x%08x HOSTCTL=0x%02x PWR=0x%02x CLK=0x%04x CAPS=0x%08x VER=0x%04x INT=0x%08x\n",
++	printf("gtel mmc: %s: HC_MODE=0x%x PRES=0x%08x HOSTCTL=0x%02x PWR=0x%02x CLK=0x%04x CAPS=0x%08x VER=0x%04x INT=0x%08x INTEN=0x%08x PWRCTL=0x%x/0x%x\n",
 +	    when, rd32(core, CORE_HC_MODE), rd32(hc, SDHCI_PRESENT_STATE), rd8(hc, SDHCI_HOST_CONTROL),
 +	    rd8(hc, SDHCI_POWER_CONTROL), rd16(hc, SDHCI_CLOCK_CONTROL), rd32(hc, SDHCI_CAPABILITIES),
-+	    rd16(hc, SDHCI_HOST_VERSION), rd32(hc, SDHCI_INT_STATUS));
++	    rd16(hc, SDHCI_HOST_VERSION), rd32(hc, SDHCI_INT_STATUS), rd32(hc, SDHCI_INT_ENABLE),
++	    rd32(core, CORE_PWRCTL_STATUS), rd32(core, CORE_PWRCTL_MASK));
++}
++
++/*
++ * Qualcomm hosts stall every bus power or I/O voltage change until software
++ * acknowledges it through the PWRCTL registers (sdhci_msm_handle_pwr_irq in
++ * Linux). Without interrupts, poll for the request and ack it.
++ */
++static void
++msm_pwr_ack(const char *why, uint32_t wait_ms)
++{
++	uint32_t st = 0;
++	for (uint32_t i = 0; i <= wait_ms * 100; i++) {
++		if ((st = rd32(core, CORE_PWRCTL_STATUS) & 0xf)) {
++			break;
++		}
++		delay(10);
++	}
++	if (!st) {
++		printf("gtel mmc: %s: no power request pending\n", why);
++		return;
++	}
++	wr32(core, CORE_PWRCTL_CLEAR, st);
++	uint32_t ack = 0;
++	if (st & (PWRCTL_BUS_ON | PWRCTL_BUS_OFF)) {
++		ack |= PWRCTL_BUS_SUCCESS;
++	}
++	if (st & (PWRCTL_IO_LOW | PWRCTL_IO_HIGH)) {
++		ack |= PWRCTL_IO_SUCCESS;
++	}
++	wr32(core, CORE_PWRCTL_CTL, ack);
++	printf("gtel mmc: %s: acked power request 0x%x\n", why, st);
 +}
 +
 +/*
@@ -317,11 +360,26 @@ index 0000000..7348509
 +	dump_regs("as lk2nd left it");
 +
 +	uint32_t mode = rd32(core, CORE_HC_MODE);
++	uint8_t pwr = rd8(hc, SDHCI_POWER_CONTROL);
 +	if (!(mode & HC_MODE_EN)) {
 +		wr32(core, CORE_HC_MODE, mode | HC_MODE_EN | FF_CLK_SW_RST_DIS);
 +		delay(100);
 +	}
++	msm_pwr_ack("mode switch", 10);
 +	sdhci_reset_lines();
++	msm_pwr_ack("line reset", 10);
++
++	/* The mode switch drops bus power; restore what lk2nd had (1.8 V, on) */
++	if (!(rd8(hc, SDHCI_POWER_CONTROL) & 1)) {
++		if (!(pwr & 1)) {
++			pwr = 0x0b;
++		}
++		wr8(hc, SDHCI_POWER_CONTROL, (uint8_t)(pwr & ~1u));
++		msm_pwr_ack("voltage select", 100);
++		wr8(hc, SDHCI_POWER_CONTROL, pwr);
++		msm_pwr_ack("bus power on", 100);
++		delay(1000);
++	}
 +
 +	uint16_t clk = rd16(hc, SDHCI_CLOCK_CONTROL);
 +	if (!(clk & CLK_INT_EN)) {
