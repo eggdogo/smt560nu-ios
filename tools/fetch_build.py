@@ -48,10 +48,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sha', help='only accept a build of this commit (prefix ok)')
     ap.add_argument('--boot', action='store_true', help='fastboot boot the image afterwards')
+    ap.add_argument('--artifact', default=ARTIFACT, help='e.g. xnu-kernel for the kernel build')
+    ap.add_argument('--out', default=ROOT, help='directory to unpack into')
     args = ap.parse_args()
 
     token = github_token()
-    arts = json.loads(api(token, f'https://api.github.com/repos/{REPO}/actions/artifacts?name={ARTIFACT}&per_page=10'))
+    arts = json.loads(api(token, f'https://api.github.com/repos/{REPO}/actions/artifacts?name={args.artifact}&per_page=10'))
     arts = [a for a in arts['artifacts'] if not a['expired']]
     if args.sha:
         arts = [a for a in arts if a['workflow_run']['head_sha'].startswith(args.sha)]
@@ -61,12 +63,13 @@ def main():
     print(f"artifact {a['id']} from {a['workflow_run']['head_sha'][:7]}, {a['created_at']}, {a['size_in_bytes']:,} bytes")
 
     blob = api(token, a['archive_download_url'])
-    with open(os.path.join(ROOT, f'{ARTIFACT}.zip'), 'wb') as f:
+    with open(os.path.join(ROOT, f'{args.artifact}.zip'), 'wb') as f:
         f.write(blob)
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        for name in z.namelist():
-            z.extract(name, ROOT)
-            print(f'  {name}')
+        names = z.namelist()
+        for name in names:
+            z.extract(name, args.out)
+        print(f'  {len(names)} files -> {args.out}: ' + ', '.join(n for n in names if '/' not in n))
 
     if args.boot:
         subprocess.check_call([sys.executable, os.path.join(ROOT, 'tools', 'pyfastboot.py'),
