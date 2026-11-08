@@ -1,0 +1,25 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..f3b710b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -746,6 +746,20 @@ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++#if defined(SWEET)
++	/*
++	 * gtel: the console log (sweetlog ring) is read back from DRAM by
++	 * tools/pull_log.py after a reset, and a reset drops dirty cache
++	 * lines: clean the whole data cache first. Then reset through PSCI
++	 * SYSTEM_RESET instead of spinning, so a panic lands back in lk2nd.
++	 */
++	printf(reboot ? "MACH Reboot (PSCI)\n" : "CPU halted\n");
++	FlushPoC_Dcache();
++	if (reboot) {
++		register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "memory");
++	}
++#endif
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);

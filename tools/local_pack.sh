@@ -17,6 +17,11 @@ s=open(sys.argv[1]).read()
 print(re.search(r'mkpayload\.py.*?--cmdline \"([^\"]*)\"', s, re.S).group(1))" "$REPO_DIR/.github/workflows/pack.yml")
 # RD=ufsroot0 boots the root from the eMMC instead of the ramdisk
 if [ -n "$RD" ]; then CMDLINE=$(echo "$CMDLINE" | sed "s/rd=[^ ]*/rd=$RD/"); fi
+# EXTRA="sweetsample=launchd ..." adds boot-args; a sweetsample there replaces the default
+if [ -n "$EXTRA" ]; then
+  case "$EXTRA" in *sweetsample=*) CMDLINE=$(echo "$CMDLINE" | sed "s/ sweetsample=[^ ]*//");; esac
+  CMDLINE="$CMDLINE $EXTRA"
+fi
 echo "cmdline: $CMDLINE"
 
 python tools/mkpayload.py "$KERNEL" "$REPO_DIR/gtel.adt" payload.bin --ramdisk slim_ramdisk.dmg --cmdline "$CMDLINE"
