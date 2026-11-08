@@ -1,0 +1,222 @@
+diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
+index 376000b..5edd325 100755
+--- a/bsd/dev/gtel_sdhci.c
++++ b/bsd/dev/gtel_sdhci.c
+@@ -365,6 +365,22 @@ mmc_read_block(uint64_t lba, uint32_t *buf)
+ 	return 0;
+ }
+ 
++/* Block layer entry (sweet_ufs.c): count 512-byte sectors into buf */
++int gtel_mmc_read(uint64_t sector, uint32_t count, void *buf);
++
++int
++gtel_mmc_read(uint64_t sector, uint32_t count, void *buf)
++{
++	uint32_t *p = buf;
++	for (uint32_t i = 0; i < count; i++) {
++		int error = mmc_read_block(sector + i, p + i * (MMC_BLOCK / 4));
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
+ static void
+ mmc_print_gpt(void)
+ {
+@@ -477,6 +493,9 @@ gtel_mmc_probe_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	mmc_print_gpt();
++
++	extern int sweet_ufs_attach_mmc(void);
++	(void)sweet_ufs_attach_mmc();
+ }
+ 
+ void gtel_mmc_probe(void);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..7e9380b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -112,8 +112,18 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	bool mmc;                               /* gtel: blocks come from the eMMC */
+ } su;
+ 
++/*
++ * gtel (SM-T560NU) has eMMC behind MSM8916 SDHCI1 instead of UFS
++ * (bsd/dev/gtel_sdhci.c). It keeps this driver's 4 KiB device block:
++ * one block = MMC_PER_BLOCK 512-byte sectors.
++ */
++#define MMC_SECTOR      512u
++#define MMC_PER_BLOCK   (UFS_BLOCK / MMC_SECTOR)
++extern int gtel_mmc_read(uint64_t sector, uint32_t count, void *buf);
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -263,6 +273,9 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++	if (su.mmc) {
++		return gtel_mmc_read(lba * MMC_PER_BLOCK, count * MMC_PER_BLOCK, (void *)(su.dma + DMA_BOUNCE));
++	}
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -284,6 +297,10 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (su.mmc) {
++		printf("SWEET UFS: eMMC writes are not implemented yet\n");
++		return EPERM;
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -296,13 +313,74 @@ static int
+ ufs_sync_cache(void)
+ {
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	if (su.mmc) {
++		return 0;
++	}
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++static int
++mmc_find_partition(const char *want)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = gtel_mmc_read(1, 1, (void *)b);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("SWEET UFS: eMMC has no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	if ((error = gtel_mmc_read(entry_lba, (nent * esz + MMC_SECTOR - 1) / MMC_SECTOR, (void *)b))) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		/* Only whole 4 KiB device blocks; drop a ragged tail */
++		if (last < first || first % MMC_PER_BLOCK) {
++			printf("SWEET UFS: \"%s\" (sectors %llu-%llu) is not 4 KiB aligned\n", want, first, last);
++			return ENXIO;
++		}
++		su.first_block = first / MMC_PER_BLOCK;
++		su.nblocks = (last - first + 1) / MMC_PER_BLOCK;
++		return 0;
++	}
++	printf("SWEET UFS: no eMMC partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (su.mmc) {
++		return mmc_find_partition(want);
++	}
+ 	int error = ufs_read_blocks(1, 1);
+ 	if (error) {
+ 		return error;
+@@ -805,6 +883,65 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * gtel: called by the eMMC probe once the card is in transfer state.
++ * Publishes the partition named by boot-arg ufsroot (default "userdata")
++ * as /dev/ufsroot0 and /dev/rufsroot0, read-only. None of sweet's other
++ * hardware (keys, touch, USB) exists here, so unlike sweet_ufs_init this
++ * starts nothing else.
++ */
++int sweet_ufs_attach_mmc(void);
++
++int
++sweet_ufs_attach_mmc(void)
++{
++	char want[64] = "userdata";
++	int error;
++
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET UFS: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	su.mmc = true;
++	su.secsize = DEV_BSIZE;
++	su.writable = false;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_find_partition(want);
++	if (!error) {
++		/* Self test: the first block, as a filesystem would see it */
++		error = ufs_read_blocks(su.first_block, 1);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("SWEET UFS: eMMC partition \"%s\" unavailable (%d)\n", want, error);
++		return error;
++	}
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	printf("SWEET UFS: \"%s\" first bytes %02x %02x %02x %02x %02x %02x %02x %02x, "
++	    "ext4 magic 0x%02x%02x, HFS+ signature %c%c\n", want,
++	    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[0x439], b[0x438],
++	    b[0x400] >= 0x20 && b[0x400] < 0x7f ? b[0x400] : '.', b[0x401] >= 0x20 && b[0x401] < 0x7f ? b[0x401] : '.');
++
++	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
++	if (su.bmajor < 0) {
++		return ENXIO;
++	}
++	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
++	if (su.cmajor < 0) {
++		return ENXIO;
++	}
++	su.bdev = makedev(su.bmajor, 0);
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++	su.ready = true;
++	printf("SWEET UFS: \"%s\" on eMMC: first block 0x%llx, %llu MiB, read-only\n",
++	    want, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	return 0;
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
