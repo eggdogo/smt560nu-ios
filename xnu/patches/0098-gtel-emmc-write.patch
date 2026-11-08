@@ -1,0 +1,220 @@
+diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
+index 2eb6bb6..a3cd250 100755
+--- a/bsd/dev/gtel_sdhci.c
++++ b/bsd/dev/gtel_sdhci.c
+@@ -71,6 +71,7 @@ extern void thread_deallocate(thread_t);
+ #define SDHCI_INT_STATUS        0x30    /* normal (low 16) | error (high 16) */
+ #define  INT_CMD_DONE           (1u << 0)
+ #define  INT_XFER_DONE          (1u << 1)
++#define  INT_BUF_WR_READY       (1u << 4)
+ #define  INT_BUF_RD_READY       (1u << 5)
+ #define  INT_ERROR              (1u << 15)
+ #define SDHCI_INT_ENABLE        0x34
+@@ -365,6 +366,86 @@ mmc_read_block(uint64_t lba, uint32_t *buf)
+ 	return 0;
+ }
+ 
++/*
++ * One 512-byte block, polled PIO (CMD24). Transfer-complete comes only
++ * after the card has released DAT0 busy, so the block is programmed when
++ * this returns 0.
++ */
++static int
++mmc_write_block(uint64_t lba, const uint32_t *buf)
++{
++	if (!wait32(SDHCI_PRESENT_STATE, PRES_CMD_INHIBIT | PRES_DAT_INHIBIT, 0, 100)) {
++		sdhci_reset_lines();
++	}
++	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
++	wr16(hc, SDHCI_BLOCK_SIZE, (uint16_t)MMC_BLOCK);
++	wr16(hc, SDHCI_BLOCK_COUNT, 1);
++	wr32(hc, SDHCI_ARGUMENT, (uint32_t)lba);
++	wr16(hc, SDHCI_TRANSFER_MODE, 0);
++	wr16(hc, SDHCI_COMMAND, (uint16_t)((24 << 8) | CMD_DATA | CMD_CRC | CMD_INDEX | CMD_RESP_48));
++
++	if (!wait32(SDHCI_INT_STATUS, INT_BUF_WR_READY | INT_ERROR, INT_BUF_WR_READY, 1000) &&
++	    !(rd32(hc, SDHCI_INT_STATUS) & INT_BUF_WR_READY)) {
++		printf("gtel mmc: write LBA %llu: no buffer: INT=0x%08x PRES=0x%08x\n", lba,
++		    rd32(hc, SDHCI_INT_STATUS), rd32(hc, SDHCI_PRESENT_STATE));
++		sdhci_reset_lines();
++		return EIO;
++	}
++	wr32(hc, SDHCI_INT_STATUS, INT_BUF_WR_READY);
++	for (unsigned i = 0; i < MMC_BLOCK / 4; i++) {
++		wr32(hc, SDHCI_BUFFER, buf[i]);
++	}
++	if (!wait32(SDHCI_INT_STATUS, INT_XFER_DONE | INT_ERROR, INT_XFER_DONE, 2000) ||
++	    (rd32(hc, SDHCI_INT_STATUS) & INT_ERROR)) {
++		printf("gtel mmc: write LBA %llu failed: INT=0x%08x PRES=0x%08x\n", lba,
++		    rd32(hc, SDHCI_INT_STATUS), rd32(hc, SDHCI_PRESENT_STATE));
++		sdhci_reset_lines();
++		return EIO;
++	}
++	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
++	/* The card may still be programming: wait for DAT0 to come back */
++	if (!wait32(SDHCI_PRESENT_STATE, PRES_DAT_INHIBIT, 0, 2000)) {
++		printf("gtel mmc: write LBA %llu: card stayed busy\n", lba);
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++/*
++ * Writes are only allowed inside the window sweet_ufs set from the GPT
++ * (the root partition); everything else on the chip (GPT, lk2nd, modem,
++ * ...) is refused here as a second line of defence.
++ */
++static uint64_t mmc_wr_lo, mmc_wr_hi;           /* [lo, hi) in 512-byte sectors */
++
++void gtel_mmc_set_write_window(uint64_t lo, uint64_t hi);
++void
++gtel_mmc_set_write_window(uint64_t lo, uint64_t hi)
++{
++	mmc_wr_lo = lo;
++	mmc_wr_hi = hi;
++	printf("gtel mmc: writes allowed in sectors [%llu, %llu)\n", lo, hi);
++}
++
++int gtel_mmc_write(uint64_t sector, uint32_t count, const void *buf);
++
++int
++gtel_mmc_write(uint64_t sector, uint32_t count, const void *buf)
++{
++	if (mmc_wr_hi == 0 || sector < mmc_wr_lo || sector >= mmc_wr_hi || count > mmc_wr_hi - sector) {
++		printf("gtel mmc: REFUSED write of %u sectors at %llu\n", count, sector);
++		return EPERM;
++	}
++	const uint32_t *p = buf;
++	for (uint32_t i = 0; i < count; i++) {
++		int error = mmc_write_block(sector + i, p + i * (MMC_BLOCK / 4));
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
+ /* Block layer entry (sweet_ufs.c): count 512-byte sectors into buf */
+ int gtel_mmc_read(uint64_t sector, uint32_t count, void *buf);
+ 
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5d5b828..245b4d8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -123,6 +123,8 @@ static struct {
+ #define MMC_SECTOR      512u
+ #define MMC_PER_BLOCK   (UFS_BLOCK / MMC_SECTOR)
+ extern int gtel_mmc_read(uint64_t sector, uint32_t count, void *buf);
++extern int gtel_mmc_write(uint64_t sector, uint32_t count, const void *buf);
++extern void gtel_mmc_set_write_window(uint64_t lo, uint64_t hi);
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+@@ -298,8 +300,7 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		return EPERM;
+ 	}
+ 	if (su.mmc) {
+-		printf("SWEET UFS: eMMC writes are not implemented yet\n");
+-		return EPERM;
++		return gtel_mmc_write(lba * MMC_PER_BLOCK, count * MMC_PER_BLOCK, (const void *)(su.dma + DMA_BOUNCE));
+ 	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+@@ -907,6 +908,67 @@ sweet_log_start(void)
+  */
+ int sweet_ufs_attach_mmc(void);
+ 
++/*
++ * ufsrw=1: open the partition for writing, after proving the write path
++ * on its LAST block (past the end of the 10 GB HFS image, never used):
++ * save it, write a pattern, read it back, restore the original.
++ * Called with sweet_ufs_lock held, after ufs_find_partition.
++ */
++static int
++mmc_write_selftest(void)
++{
++	uint64_t lo = su.first_block * MMC_PER_BLOCK;
++	uint64_t hi = (su.first_block + su.nblocks) * MMC_PER_BLOCK;
++	uint64_t last = su.first_block + su.nblocks - 1;
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint8_t *save = kalloc_data(UFS_BLOCK, Z_WAITOK);
++	int error;
++
++	if (!save) {
++		return ENOMEM;
++	}
++	gtel_mmc_set_write_window(lo, hi);
++	su.writable = true;
++	if ((error = ufs_read_blocks(last, 1))) {
++		goto fail;
++	}
++	memcpy(save, b, UFS_BLOCK);
++	for (uint32_t i = 0; i < UFS_BLOCK; i++) {
++		b[i] = (uint8_t)(i * 7 + 0x5a);
++	}
++	if ((error = ufs_write_blocks(last, 1))) {
++		goto fail;
++	}
++	memset(b, 0, UFS_BLOCK);
++	if ((error = ufs_read_blocks(last, 1))) {
++		goto fail;
++	}
++	for (uint32_t i = 0; i < UFS_BLOCK; i++) {
++		if (b[i] != (uint8_t)(i * 7 + 0x5a)) {
++			printf("SWEET UFS: write self-test MISMATCH at byte %u: 0x%02x\n", i, b[i]);
++			error = EIO;
++			break;
++		}
++	}
++	memcpy(b, save, UFS_BLOCK);
++	int e2 = ufs_write_blocks(last, 1);
++	if (!error) {
++		error = e2;
++	}
++	if (error) {
++		goto fail;
++	}
++	kfree_data(save, UFS_BLOCK);
++	printf("SWEET UFS: eMMC write self-test ok (block 0x%llx)\n", last);
++	return 0;
++fail:
++	printf("SWEET UFS: eMMC write self-test FAILED (%d), staying read-only\n", error);
++	su.writable = false;
++	gtel_mmc_set_write_window(0, 0);
++	kfree_data(save, UFS_BLOCK);
++	return 0;
++}
++
+ int
+ sweet_ufs_attach_mmc(void)
+ {
+@@ -925,6 +987,8 @@ sweet_ufs_attach_mmc(void)
+ 	su.mmc = true;
+ 	su.secsize = DEV_BSIZE;
+ 	su.writable = false;
++	int rw = 0;
++	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_find_partition(want);
+@@ -932,6 +996,9 @@ sweet_ufs_attach_mmc(void)
+ 		/* Self test: the first block, as a filesystem would see it */
+ 		error = ufs_read_blocks(su.first_block, 1);
+ 	}
++	if (!error && rw) {
++		error = mmc_write_selftest();
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		printf("SWEET UFS: eMMC partition \"%s\" unavailable (%d)\n", want, error);
+@@ -961,8 +1028,8 @@ sweet_ufs_attach_mmc(void)
+ 	printf("SWEET ufs: root aliased as disk0s1\n");
+ #endif
+ 	su.ready = true;
+-	printf("SWEET UFS: \"%s\" on eMMC: first block 0x%llx, %llu MiB, read-only\n",
+-	    want, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	printf("SWEET UFS: \"%s\" on eMMC: first block 0x%llx, %llu MiB, %s\n",
++	    want, su.first_block, su.nblocks * UFS_BLOCK >> 20, su.writable ? "read-write" : "read-only");
+ 	return 0;
+ }
+ 
