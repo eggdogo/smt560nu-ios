@@ -1,0 +1,77 @@
+name: rootfs
+
+# Full iOS 12.5.7 root filesystem for the eMMC (flashed to userdata, booted
+# with rd=ufsroot0). The IPSW's root is APFS, which this kernel cannot
+# read, so macOS copies it into a case-sensitive HFS+ volume, decompressing
+# HFS-compressed files, and adds the gtel pieces from slim_essentials.tar.gz.
+# Output: gtelroot.img.zst, a raw HFSX image (zeros compress away).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "rootfs/**"
+      - ".github/workflows/rootfs.yml"
+
+env:
+  IPSW_URL: https://updates.cdn-apple.com/2023FCSWinter/fullrestores/032-14132/A3C10B93-0E34-405D-8A92-92AA354BABF0/iPad_64bit_12.5.7_16H81_Restore.ipsw
+  ROOTFS_MEMBER: 038-87004-055.dmg
+  IMAGE_SIZE: 10g
+
+jobs:
+  rootfs:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the rootfs DMG from the IPSW
+        run: |
+          df -h .
+          python3 tools/remotezip.py "$IPSW_URL" get "$ROOTFS_MEMBER" ios_root.dmg
+          ls -l ios_root.dmg
+
+      - name: Copy APFS root into an HFSX image
+        run: |
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/ios ios_root.dmg
+          hdiutil create -size "$IMAGE_SIZE" -type SPARSE -fs "Case-sensitive HFS+" -volname gtelroot -layout NONE gtelroot
+          hdiutil attach -owners on -nobrowse -mountpoint /tmp/root gtelroot.sparseimage
+          sudo ditto --nohfsCompression /tmp/ios /tmp/root
+          du -sh /tmp/root
+          hdiutil detach /tmp/ios
+          rm ios_root.dmg
+
+      - name: Add the gtel pieces
+        run: |
+          mkdir ess && tar -xzf slim_essentials.tar.gz -C ess
+          # patched launchd and dyld, the bring-up shell and its script
+          sudo cp ess/sbin/launchd /tmp/root/sbin/launchd
+          sudo cp ess/usr/lib/dyld /tmp/root/usr/lib/dyld
+          sudo mkdir -p /tmp/root/usr/local/bin
+          sudo cp ess/usr/local/bin/restored_external /tmp/root/usr/local/bin/gtel_shell
+          sudo cp ess/gtel.rc /tmp/root/gtel.rc
+          sudo cp rootfs/com.gtel.shell.plist /tmp/root/System/Library/LaunchDaemons/com.gtel.shell.plist
+          sudo chown root:wheel /tmp/root/sbin/launchd /tmp/root/usr/lib/dyld /tmp/root/usr/local/bin/gtel_shell \
+            /tmp/root/gtel.rc /tmp/root/System/Library/LaunchDaemons/com.gtel.shell.plist
+          sudo chmod 755 /tmp/root/sbin/launchd /tmp/root/usr/lib/dyld /tmp/root/usr/local/bin/gtel_shell
+          sudo chmod 644 /tmp/root/gtel.rc /tmp/root/System/Library/LaunchDaemons/com.gtel.shell.plist
+          ls -l /tmp/root/System/Library/Caches/com.apple.dyld/ || true
+          ls /tmp/root/System/Library/LaunchDaemons | wc -l
+          df -h /tmp/root
+
+      - name: Raw image, zstd
+        run: |
+          hdiutil detach /tmp/root
+          brew install zstd
+          DEV=$(hdiutil attach -nomount -noverify gtelroot.sparseimage | awk 'NR==1{print $1}')
+          echo "device $DEV"
+          sudo dd if="${DEV/disk/rdisk}" bs=4m | zstd -T0 -6 -o gtelroot.img.zst
+          hdiutil detach "$DEV"
+          ls -l gtelroot.img.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gtel-rootfs
+          path: gtelroot.img.zst
+          compression-level: 0
+          retention-days: 7
