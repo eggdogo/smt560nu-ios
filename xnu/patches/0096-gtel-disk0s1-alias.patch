@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 64d9a11..ff9c2f8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -939,6 +939,12 @@ sweet_ufs_attach_mmc(void)
+ 	su.bdev = makedev(su.bmajor, 0);
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++#if defined(SWEET)
++	/* gtel: iOS fstab and the launchd fsck task name the root /dev/disk0s1 */
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "disk0s1");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rdisk0s1");
++	printf("SWEET ufs: root aliased as disk0s1\n");
++#endif
+ 	su.ready = true;
+ 	printf("SWEET UFS: \"%s\" on eMMC: first block 0x%llx, %llu MiB, read-only\n",
+ 	    want, su.first_block, su.nblocks * UFS_BLOCK >> 20);
