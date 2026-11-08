@@ -36,7 +36,14 @@ jobs:
           hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/ios ios_root.dmg
           hdiutil create -size "$IMAGE_SIZE" -type SPARSE -fs "Case-sensitive HFS+" -volname gtelroot -layout NONE gtelroot
           hdiutil attach -owners on -nobrowse -mountpoint /tmp/root gtelroot.sparseimage
-          sudo ditto --nohfsCompression /tmp/ios /tmp/root
+          # Everything but the volume's own bookkeeping (".HFS+ Private Directory Data\r"
+          # holds hard-link targets; ditto cannot recreate it and copies the links' data anyway)
+          for e in /tmp/ios/* /tmp/ios/.[!.]*; do
+            case "$(basename "$e")" in .HFS+\ Private*|.fseventsd|.Trashes|.Spotlight-V100) continue;; esac
+            sudo ditto --nohfsCompression "$e" "/tmp/root/$(basename "$e")"
+          done
+          ls -la /tmp/root
+          test -x /tmp/root/sbin/launchd
           du -sh /tmp/root
           hdiutil detach /tmp/ios
           rm ios_root.dmg
