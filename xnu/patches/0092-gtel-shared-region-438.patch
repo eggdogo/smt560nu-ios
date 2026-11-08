@@ -1,0 +1,94 @@
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index 422873e..ab3e55f 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -661,7 +661,7 @@
+ 436	AUE_NULL	ALL	{ int nosys(void); }
+ #endif
+ 437	AUE_NULL	ALL	{ int nosys(void); } { old shared_region_slide_np }
+-438	AUE_NULL	ALL	{ int nosys(void); } { old shared_region_map_and_slide_np }
++438	AUE_NULL	ALL	{ int shared_region_map_and_slide_np(int fd, uint32_t count, const struct shared_file_mapping_np *mappings, uint32_t slide, uint64_t *slide_start, uint32_t slide_size) NO_SYSCALL_STUB; }
+ 439	AUE_NULL	ALL	{ int kas_info(int selector, void *value, size_t *size); }
+ #if CONFIG_MEMORYSTATUS
+ 440	AUE_NULL	ALL	{ int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, user_addr_t buffer, size_t buffersize); }
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 636bd3d..0e1f0e1 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -3002,6 +3002,76 @@ done:
+ 	return kr;
+ }
+ 
++/*
++ * gtel runs the iOS 12.5.7 userland, whose dyld maps the shared cache with
++ * the old syscall 438 (one file, one slide-info blob) that this kernel
++ * replaced with 536. Without it dyld takes SIGSYS and launchd cannot start
++ * from a full root. Translate the old arguments into the new form:
++ * addresses come already slid by dyld, so the slide is used as given, and
++ * the slide info goes to the mapping marked VM_PROT_SLIDE (else the second,
++ * the data mapping, as in the iOS 12 cache layout).
++ */
++int
++shared_region_map_and_slide_np(
++	struct proc                                *p,
++	struct shared_region_map_and_slide_np_args *uap,
++	__unused int                               *retvalp)
++{
++	uint32_t count = uap->count;
++	struct shared_file_mapping_np *old = NULL;
++	struct shared_file_mapping_slide_np *mappings = NULL;
++	struct shared_file_np file;
++	int slide_idx = -1;
++	int error;
++
++	if (count == 0) {
++		return 0;
++	}
++	if (count > SFM_MAX) {
++		return EINVAL;
++	}
++	old = kalloc_data(count * sizeof(old[0]), Z_WAITOK | Z_ZERO);
++	mappings = kalloc_data(count * sizeof(mappings[0]), Z_WAITOK | Z_ZERO);
++	if (old == NULL || mappings == NULL) {
++		error = ENOMEM;
++		goto done;
++	}
++	if ((error = copyin(uap->mappings, old, count * sizeof(old[0])))) {
++		goto done;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		mappings[i].sms_address = old[i].sfm_address;
++		mappings[i].sms_size = old[i].sfm_size;
++		mappings[i].sms_file_offset = old[i].sfm_file_offset;
++		mappings[i].sms_max_prot = old[i].sfm_max_prot;
++		mappings[i].sms_init_prot = old[i].sfm_init_prot;
++		if (slide_idx < 0 && ((old[i].sfm_max_prot | old[i].sfm_init_prot) & VM_PROT_SLIDE)) {
++			slide_idx = (int)i;
++		}
++	}
++	if (uap->slide_size != 0) {
++		if (slide_idx < 0) {
++			slide_idx = count > 1 ? 1 : 0;
++		}
++		mappings[slide_idx].sms_slide_size = uap->slide_size;
++		mappings[slide_idx].sms_slide_start = uap->slide_start;
++		mappings[slide_idx].sms_max_prot |= VM_PROT_SLIDE;
++		mappings[slide_idx].sms_init_prot |= VM_PROT_SLIDE;
++	}
++	file.sf_fd = uap->fd;
++	file.sf_mappings_count = count;
++	file.sf_slide = uap->slide;
++
++	error = _shared_region_map_and_slide(p, 1, &file, count, mappings);
++	printf("SWEET shared_region: %s[%d] map_and_slide_np: %u mappings, slide 0x%x, "
++	    "slide info %u bytes on mapping %d -> %d\n", p->p_comm, proc_getpid(p),
++	    count, uap->slide, uap->slide_size, slide_idx, error);
++done:
++	kfree_data(old, count * sizeof(old[0]));
++	kfree_data(mappings, count * sizeof(mappings[0]));
++	return error;
++}
++
+ /*
+  * A syscall for dyld to use to map data pages that need load time relocation fixups.
+  * The fixups are performed by a custom pager during page-in, so the pages still appear
