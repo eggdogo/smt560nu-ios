@@ -3,19 +3,14 @@
 # Everything printed also lands in the kernel's RAM log: after the run, hold
 # power to reset into lk2nd and run `python tools/pull_log.py` to get it all.
 
-# Timer debugging: every spawn prints a TIMER line with the live
-# CNTV/GIC-400 state (patch_timer_diag.py). Compare before/after a busy-wait.
-echo === timer diag: spawn 1 ===
-spawn /usr/sbin/syslogd
-spin 500
-echo === timer diag: spawn 2 (after spin) ===
-spawn /usr/libexec/xpcproxy
-spin 500
-echo === timer diag: spawn 3 ===
-spawn /usr/libexec/xpcproxy
+echo === boot state ===
+uname
+ps
 
-echo === now sleep 2 (hangs if the timer never fires) ===
-sleep 2
-echo === sleep returned! timer works ===
-spawn /usr/libexec/xpcproxy
+# Timers work now: give launchd time to start whatever it wants on its own
+echo === waiting 20s for launchd ===
+sleep 20
+ps
+ls /System/Library/LaunchDaemons
+
 echo === script done, safe to reset into lk2nd ===

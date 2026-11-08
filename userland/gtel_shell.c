@@ -254,6 +254,34 @@ static void cmd_spawn(int argc, char **argv) {
     }
 }
 
+extern int sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+
+/* struct kinfo_proc (arm64 Darwin): 648 bytes, p_pid @40, p_comm @243, e_ppid @560 */
+#define KP_SIZE  648
+#define KP_PID   40
+#define KP_COMM  243
+#define KP_PPID  560
+
+static void cmd_ps(void) {
+    static char buf[KP_SIZE * 256];
+    int mib[3] = {1 /* CTL_KERN */, 14 /* KERN_PROC */, 0 /* KERN_PROC_ALL */};
+    size_t sz = sizeof(buf);
+    if (sysctl(mib, 3, buf, &sz, (void*)0, 0) != 0) {
+        printf("ps: sysctl failed: errno %d\n", errno);
+        return;
+    }
+    puts("  PID  PPID  COMMAND");
+    for (size_t off = 0; off + KP_SIZE <= sz; off += KP_SIZE) {
+        int pid = *(int *)(buf + off + KP_PID);
+        int ppid = *(int *)(buf + off + KP_PPID);
+        char comm[17];
+        for (int i = 0; i < 16; i++) comm[i] = buf[off + KP_COMM + i];
+        comm[16] = '\0';
+        printf("%5d %5d  %s\n", pid, ppid, comm);
+    }
+    printf("ps: %d processes\n", (int)(sz / KP_SIZE));
+}
+
 static int parse_uint(const char *s) {
     int v = 0;
     while (s && *s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
@@ -296,6 +324,7 @@ static void execute_line(char *line) {
         puts("  id              Display user and process IDs");
         puts("  ls [path]       List directory contents");
         puts("  dev             Scan /dev for disks and ttys");
+        puts("  ps              List running processes");
         puts("  cat <path>      Display file contents");
         puts("  spawn <path>    Spawn binary with posix_spawn");
         puts("  echo <text>     Print text");
@@ -322,6 +351,8 @@ static void execute_line(char *line) {
         puts("");
     } else if (strcmp(toks[0], "sleep") == 0) {
         sleep(ntoks > 1 ? parse_uint(toks[1]) : 1);
+    } else if (strcmp(toks[0], "ps") == 0) {
+        cmd_ps();
     } else if (strcmp(toks[0], "spin") == 0) {
         /* Busy-wait that needs no timer interrupt, unlike sleep */
         unsigned long n = (unsigned long)(ntoks > 1 ? parse_uint(toks[1]) : 100) * 1000000UL;

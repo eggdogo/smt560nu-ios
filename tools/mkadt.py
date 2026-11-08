@@ -15,7 +15,7 @@ import adt  # noqa: E402
 # and continuous splash FB (0x8e000000).
 # Free contiguous RAM starts safely at 0x90000000 through 0xdf000000 (~1.25 GB).
 PHYS_BASE = 0x90000000
-MEM_SIZE  = 0x20000000   # ~1.25 GB available, below 1 MB panic log
+MEM_SIZE  = 0x40000000   # 1 GiB: 0x90000000-0xd0000000, clear of lk2nd/TZ below and the top of RAM
 PANIC_LOG_SIZE = 0x100000
 
 # MSM8916 Hardware MMIO addresses
