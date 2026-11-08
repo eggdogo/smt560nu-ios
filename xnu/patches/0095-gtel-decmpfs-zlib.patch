@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/decmpfs.c b/bsd/kern/decmpfs.c
-index ff8c5e3..96120a4 100644
+index ff8c5e3..e89d4af 100644
 --- a/bsd/kern/decmpfs.c
 +++ b/bsd/kern/decmpfs.c
 @@ -2349,6 +2349,228 @@ SECURITY_READ_ONLY_EARLY(static decmpfs_registration) Type1Reg =
@@ -231,15 +231,14 @@ index ff8c5e3..96120a4 100644
  void
  decmpfs_init(void)
  {
-@@ -2360,6 +2582,12 @@ decmpfs_init(void)
+@@ -2360,6 +2582,11 @@ decmpfs_init(void)
  	decmpfs_ctx = vfs_context_create(vfs_context_kernel());
  
  	register_decmpfs_decompressor(CMP_Type1, &Type1Reg);
 +#if defined(SWEET)
 +	register_decmpfs_decompressor(3, &gtel_zlib3_reg);
 +	register_decmpfs_decompressor(4, &gtel_zlib4_reg);
-+	printf("SWEET decmpfs: zlib types 3/4 registered
-+");
++	printf("SWEET decmpfs: zlib types 3/4 registered\n");
 +#endif
  
  	ktriage_register_subsystem_strings(KDBG_TRIAGE_SUBSYS_DECMPFS, &ktriage_decmpfs_subsystem_strings);
