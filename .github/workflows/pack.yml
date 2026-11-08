@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - "slim_essentials.tar.gz"
+      - "gtel.adt"
+      - "kernel.development.sweet"
       - ".github/workflows/pack.yml"
 
 jobs:

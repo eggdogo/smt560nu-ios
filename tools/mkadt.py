@@ -38,7 +38,7 @@ FB_STRIDE = 2400            # 800 * 3 bytes
 
 # ARM Generic Architected Timer
 TIMEBASE  = 19200000     # 19.2 MHz Qualcomm QTimer frequency
-VTIMER_INTID = 27        # Standard ARM Virtual Timer PPI
+VTIMER_INTID = 20        # MSM8916 QGIC2 wires the EL1 virtual timer to PPI 4 (INTID 20), not 27
 
 # MSM8916 has 4x Cortex-A53 cores clocked up to 1.19 GHz
 CPU_COUNT = 4
