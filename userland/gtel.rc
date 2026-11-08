@@ -1,0 +1,21 @@
+# gtel.rc - boot script for gtel_shell (installed at /gtel.rc on the ramdisk)
+# One command per line, same commands as the interactive prompt ('help' lists them).
+# Use 'sleep' to leave time for a photo, and 'clear' before a new page.
+
+echo === page 1: system ===
+uname
+dev
+sleep 15
+
+clear
+echo === page 2: syslogd + xpcproxy ===
+spawn /usr/sbin/syslogd
+spawn /usr/libexec/xpcproxy
+sleep 15
+
+clear
+echo === page 3: launch daemons ===
+ls /System/Library/LaunchDaemons
+sleep 15
+
+echo === script done ===
