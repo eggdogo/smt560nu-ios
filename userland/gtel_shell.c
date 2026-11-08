@@ -10,7 +10,7 @@ typedef int pid_t;
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 typedef long long off_t;
-typedef int mode_t;
+typedef unsigned short mode_t;  /* Darwin's mode_t is 16-bit; int shifted every later stat field */
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
@@ -202,7 +202,9 @@ static void cmd_scan_dev(void) {
                 printf("  [BLOCK] %-16s rdev=0x%04x size=%lld\n", de->d_name, st.st_rdev, (long long)st.st_size);
                 block_cnt++;
             } else if (S_ISCHR(st.st_mode)) {
-                /* Filter for disks, ttys, consoles */
+                /* Filter for disks, ttys, consoles; skip the pty pairs (ttyw5 etc.) */
+                int pty = strncmp(de->d_name, "tty", 3) == 0 && strlen(de->d_name) == 5;
+                if (pty) continue;
                 if (strncmp(de->d_name, "tty", 3) == 0 ||
                     strncmp(de->d_name, "ptm", 3) == 0 ||
                     strncmp(de->d_name, "console", 7) == 0 ||
@@ -256,6 +258,16 @@ static int parse_uint(const char *s) {
     int v = 0;
     while (s && *s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
     return v;
+}
+
+/*
+ * The kernel keeps a RAM copy of the console (sweetlog) that tools/pull_log.py
+ * reads back from lk2nd after a reset, but a reset drops dirty cache lines.
+ * Writing a buffer bigger than the 512 KiB L2 pushes the log out to DRAM.
+ */
+static void flush_log(void) {
+    static volatile char evict[2 << 20];
+    for (unsigned long i = 0; i < sizeof(evict); i += 64) evict[i]++;
 }
 
 /* The kernel fbcon wraps instead of scrolling; a screenful of newlines blanks it */
@@ -372,11 +384,14 @@ static int run_script(const char *path) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p && *p != '#' && *p != '\r') {
             printf("gtel-ios# %s\n", p);
+            flush_log();
             execute_line(p);
+            flush_log();
         }
         line = next;
     }
     printf("[gtel] %s finished.\n", path);
+    flush_log();
     return 0;
 }
 

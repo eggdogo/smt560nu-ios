@@ -1,21 +1,18 @@
 # gtel.rc - boot script for gtel_shell (installed at /gtel.rc on the ramdisk)
 # One command per line, same commands as the interactive prompt ('help' lists them).
-# Use 'sleep' to leave time for a photo, and 'clear' before a new page.
+# Everything printed also lands in the kernel's RAM log: after the run, hold
+# power to reset into lk2nd and run `python tools/pull_log.py` to get it all.
 
-echo === page 1: system ===
+echo === system ===
 uname
 dev
-sleep 15
 
-clear
-echo === page 2: syslogd + xpcproxy ===
+echo === syslogd + xpcproxy ===
 spawn /usr/sbin/syslogd
 spawn /usr/libexec/xpcproxy
-sleep 15
+sleep 5
 
-clear
-echo === page 3: launch daemons ===
+echo === launch daemons ===
 ls /System/Library/LaunchDaemons
-sleep 15
 
-echo === script done ===
+echo === script done, safe to reset into lk2nd ===
