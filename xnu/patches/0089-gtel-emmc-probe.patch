@@ -1,0 +1,379 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..9730cab 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/gtel_sdhci.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
+new file mode 100755
+index 0000000..7348509
+--- /dev/null
++++ b/bsd/dev/gtel_sdhci.c
+@@ -0,0 +1,347 @@
++/*
++ * gtel eMMC probe: MSM8916 SDHCI1 (SM-T560NU internal eMMC), read-only.
++ *
++ * First step towards an eMMC root. lk2nd initialised the card, then (CAF
++ * LK target_uninit) put it to sleep and switched the controller back to
++ * legacy MCI mode before jumping to us. This re-enables SDHCI mode, wakes
++ * and selects the card, and reads the GPT with polled PIO single-block
++ * reads (no DMA, no interrupts), logging every step so a failure can be
++ * read back with tools/pull_log.py. Runs in its own thread so a stuck
++ * card never holds up launchd. Disabled with boot-arg gtelmmc=0.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++/* msm8916.dtsi sdhc_1: hc_mem 0x07824900, core_mem 0x07824000 */
++#define SDHC1_HC_PA             0x07824900
++#define SDHC1_CORE_PA           0x07824000
++
++#define CORE_HC_MODE            0x78
++#define  HC_MODE_EN             (1u << 0)
++#define  FF_CLK_SW_RST_DIS      (1u << 13)
++
++/* Standard SDHCI registers */
++#define SDHCI_BLOCK_SIZE        0x04
++#define SDHCI_BLOCK_COUNT       0x06
++#define SDHCI_ARGUMENT          0x08
++#define SDHCI_TRANSFER_MODE     0x0c
++#define  XFER_READ              (1u << 4)
++#define SDHCI_COMMAND           0x0e
++#define  CMD_RESP_NONE          0x00
++#define  CMD_RESP_48            0x02
++#define  CMD_RESP_48_BUSY       0x03
++#define  CMD_CRC                (1u << 3)
++#define  CMD_INDEX              (1u << 4)
++#define  CMD_DATA               (1u << 5)
++#define SDHCI_RESPONSE          0x10
++#define SDHCI_BUFFER            0x20
++#define SDHCI_PRESENT_STATE     0x24
++#define  PRES_CMD_INHIBIT       (1u << 0)
++#define  PRES_DAT_INHIBIT       (1u << 1)
++#define SDHCI_HOST_CONTROL      0x28
++#define SDHCI_POWER_CONTROL     0x29
++#define SDHCI_CLOCK_CONTROL     0x2c
++#define  CLK_INT_EN             (1u << 0)
++#define  CLK_INT_STABLE         (1u << 1)
++#define  CLK_SD_EN              (1u << 2)
++#define SDHCI_SOFTWARE_RESET    0x2f
++#define  RESET_CMD              (1u << 1)
++#define  RESET_DATA             (1u << 2)
++#define SDHCI_INT_STATUS        0x30    /* normal (low 16) | error (high 16) */
++#define  INT_CMD_DONE           (1u << 0)
++#define  INT_XFER_DONE          (1u << 1)
++#define  INT_BUF_RD_READY       (1u << 5)
++#define  INT_ERROR              (1u << 15)
++#define SDHCI_INT_ENABLE        0x34
++#define SDHCI_SIGNAL_ENABLE     0x38
++#define SDHCI_CAPABILITIES      0x40
++#define SDHCI_HOST_VERSION      0xfe
++
++#define MMC_BLOCK               512u
++#define GPT_MAX_ENTRIES         128u
++
++static vm_offset_t hc, core;
++static uint32_t card_rca;
++
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline uint16_t rd16(vm_offset_t b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
++static inline uint8_t rd8(vm_offset_t b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
++static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
++
++/* Poll until (reg & mask) == want, 10 us steps; false on timeout */
++static bool
++wait32(uint32_t off, uint32_t mask, uint32_t want, uint32_t timeout_ms)
++{
++	for (uint32_t i = 0; i < timeout_ms * 100; i++) {
++		if ((rd32(hc, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++sdhci_reset_lines(void)
++{
++	wr8(hc, SDHCI_SOFTWARE_RESET, (uint8_t)(RESET_CMD | RESET_DATA));
++	for (int i = 0; i < 10000 && (rd8(hc, SDHCI_SOFTWARE_RESET) & (RESET_CMD | RESET_DATA)); i++) {
++		delay(10);
++	}
++}
++
++static void
++dump_regs(const char *when)
++{
++	printf("gtel mmc: %s: HC_MODE=0x%x PRES=0x%08x HOSTCTL=0x%02x PWR=0x%02x CLK=0x%04x CAPS=0x%08x VER=0x%04x INT=0x%08x\n",
++	    when, rd32(core, CORE_HC_MODE), rd32(hc, SDHCI_PRESENT_STATE), rd8(hc, SDHCI_HOST_CONTROL),
++	    rd8(hc, SDHCI_POWER_CONTROL), rd16(hc, SDHCI_CLOCK_CONTROL), rd32(hc, SDHCI_CAPABILITIES),
++	    rd16(hc, SDHCI_HOST_VERSION), rd32(hc, SDHCI_INT_STATUS));
++}
++
++/*
++ * Issue one command; flags is the low byte of the SDHCI command register.
++ * Returns 0 and the R1/R1b response, or an error with the status logged.
++ */
++static int
++mmc_cmd(uint8_t idx, uint32_t arg, uint8_t flags, uint32_t *resp)
++{
++	uint32_t inhibit = PRES_CMD_INHIBIT | ((flags & CMD_DATA) || (flags & 3) == CMD_RESP_48_BUSY ? PRES_DAT_INHIBIT : 0);
++	if (!wait32(SDHCI_PRESENT_STATE, inhibit, 0, 100)) {
++		printf("gtel mmc: CMD%u: controller busy, PRES=0x%08x\n", idx, rd32(hc, SDHCI_PRESENT_STATE));
++		sdhci_reset_lines();
++		return EBUSY;
++	}
++	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
++	wr32(hc, SDHCI_ARGUMENT, arg);
++	wr16(hc, SDHCI_COMMAND, (uint16_t)((idx << 8) | flags));
++	if (!wait32(SDHCI_INT_STATUS, INT_CMD_DONE | INT_ERROR, INT_CMD_DONE, 1000) &&
++	    !(rd32(hc, SDHCI_INT_STATUS) & INT_CMD_DONE)) {
++		printf("gtel mmc: CMD%u arg 0x%x failed: INT=0x%08x\n", idx, arg, rd32(hc, SDHCI_INT_STATUS));
++		sdhci_reset_lines();
++		return EIO;
++	}
++	if (resp) {
++		*resp = rd32(hc, SDHCI_RESPONSE);
++	}
++	wr32(hc, SDHCI_INT_STATUS, INT_CMD_DONE);
++	/* R1b: the card holds DAT0 low while busy */
++	if ((flags & 3) == CMD_RESP_48_BUSY && !wait32(SDHCI_PRESENT_STATE, PRES_DAT_INHIBIT, 0, 1000)) {
++		printf("gtel mmc: CMD%u: card stayed busy\n", idx);
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++static const char *const mmc_states[] = {
++	"idle", "ready", "ident", "stby", "tran", "data", "rcv", "prg", "dis", "btst", "slp",
++};
++
++static int
++mmc_status(uint32_t rca, uint32_t *state)
++{
++	uint32_t r;
++	int error = mmc_cmd(13, rca << 16, CMD_RESP_48 | CMD_CRC | CMD_INDEX, &r);
++	if (!error) {
++		*state = (r >> 9) & 0xf;
++	}
++	return error;
++}
++
++/* Bring the card lk2nd left behind to the transfer state */
++static int
++mmc_wake(void)
++{
++	uint32_t state = 0, r;
++	int error = ENODEV;
++
++	/* CAF LK uses RCA 2 for eMMC; try the others in case lk2nd differs */
++	static const uint32_t rcas[] = { 2, 1, 3 };
++	for (unsigned i = 0; i < sizeof(rcas) / sizeof(rcas[0]); i++) {
++		if (!(error = mmc_status(rcas[i], &state))) {
++			card_rca = rcas[i];
++			break;
++		}
++	}
++	if (error) {
++		/* A sleeping card ignores CMD13; wake RCA 2 blindly and retry */
++		printf("gtel mmc: no answer to CMD13, trying CMD5 awake\n");
++		card_rca = 2;
++		(void)mmc_cmd(5, card_rca << 16, CMD_RESP_48_BUSY, &r);
++		if ((error = mmc_status(card_rca, &state))) {
++			return error;
++		}
++	}
++	printf("gtel mmc: RCA %u, state %s\n", card_rca, state < 11 ? mmc_states[state] : "?");
++
++	if (state == 10) {              /* slp -> stby */
++		if ((error = mmc_cmd(5, card_rca << 16, CMD_RESP_48_BUSY, &r))) {
++			return error;
++		}
++		(void)mmc_status(card_rca, &state);
++		printf("gtel mmc: after CMD5 awake: %s\n", state < 11 ? mmc_states[state] : "?");
++	}
++	if (state == 3) {               /* stby -> tran */
++		if ((error = mmc_cmd(7, card_rca << 16, CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX, &r))) {
++			return error;
++		}
++		(void)mmc_status(card_rca, &state);
++		printf("gtel mmc: after CMD7 select: %s\n", state < 11 ? mmc_states[state] : "?");
++	}
++	return state == 4 ? 0 : EIO;
++}
++
++/* One 512-byte block, polled PIO */
++static int
++mmc_read_block(uint64_t lba, uint32_t *buf)
++{
++	if (!wait32(SDHCI_PRESENT_STATE, PRES_CMD_INHIBIT | PRES_DAT_INHIBIT, 0, 100)) {
++		sdhci_reset_lines();
++	}
++	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
++	wr16(hc, SDHCI_BLOCK_SIZE, (uint16_t)MMC_BLOCK);
++	wr16(hc, SDHCI_BLOCK_COUNT, 1);
++	wr32(hc, SDHCI_ARGUMENT, (uint32_t)lba);        /* sector addressing (>2 GiB card) */
++	wr16(hc, SDHCI_TRANSFER_MODE, (uint16_t)XFER_READ);
++	wr16(hc, SDHCI_COMMAND, (uint16_t)((17 << 8) | CMD_DATA | CMD_CRC | CMD_INDEX | CMD_RESP_48));
++
++	if (!wait32(SDHCI_INT_STATUS, INT_BUF_RD_READY | INT_ERROR, INT_BUF_RD_READY, 1000) &&
++	    !(rd32(hc, SDHCI_INT_STATUS) & INT_BUF_RD_READY)) {
++		printf("gtel mmc: read LBA %llu failed: INT=0x%08x PRES=0x%08x\n", lba,
++		    rd32(hc, SDHCI_INT_STATUS), rd32(hc, SDHCI_PRESENT_STATE));
++		sdhci_reset_lines();
++		return EIO;
++	}
++	wr32(hc, SDHCI_INT_STATUS, INT_BUF_RD_READY);
++	for (unsigned i = 0; i < MMC_BLOCK / 4; i++) {
++		buf[i] = rd32(hc, SDHCI_BUFFER);
++	}
++	if (!wait32(SDHCI_INT_STATUS, INT_XFER_DONE, INT_XFER_DONE, 1000)) {
++		printf("gtel mmc: no transfer-complete for LBA %llu: INT=0x%08x\n", lba, rd32(hc, SDHCI_INT_STATUS));
++	}
++	wr32(hc, SDHCI_INT_STATUS, 0xffffffff);
++	return 0;
++}
++
++static void
++mmc_print_gpt(void)
++{
++	static uint32_t blk[MMC_BLOCK / 4];
++	const uint8_t *b = (const uint8_t *)blk;
++
++	if (mmc_read_block(1, blk)) {
++		return;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("gtel mmc: LBA 1 is not a GPT header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++		return;
++	}
++	uint64_t entry_lba, last_usable;
++	uint32_t nent, esz;
++	memcpy(&last_usable, b + 48, 8);
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	printf("gtel mmc: GPT: %u entries of %u bytes at LBA %llu, disk %llu MiB\n",
++	    nent, esz, entry_lba, (last_usable + 1) * MMC_BLOCK >> 20);
++	if (esz != 128 || nent > GPT_MAX_ENTRIES) {
++		return;
++	}
++
++	unsigned shown = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		if (i % (MMC_BLOCK / 128) == 0 && mmc_read_block(entry_lba + i / (MMC_BLOCK / 128), blk)) {
++			return;
++		}
++		const uint8_t *e = b + (i % (MMC_BLOCK / 128)) * 128;
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (first == 0 && last == 0) {
++			continue;
++		}
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		printf("gtel mmc:  %2u %-16s LBA %8llu-%8llu  %6llu MiB\n", i + 1, name, first, last,
++		    (last - first + 1) * MMC_BLOCK >> 20);
++		shown++;
++	}
++	printf("gtel mmc: %u partitions\n", shown);
++}
++
++static void
++gtel_mmc_probe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	/* Both register blocks share one 4 KiB page; hc_mem is not page aligned */
++	core = ml_io_map(SDHC1_CORE_PA, 0x1000);
++	hc = core + (SDHC1_HC_PA - SDHC1_CORE_PA);
++	dump_regs("as lk2nd left it");
++
++	uint32_t mode = rd32(core, CORE_HC_MODE);
++	if (!(mode & HC_MODE_EN)) {
++		wr32(core, CORE_HC_MODE, mode | HC_MODE_EN | FF_CLK_SW_RST_DIS);
++		delay(100);
++	}
++	sdhci_reset_lines();
++
++	uint16_t clk = rd16(hc, SDHCI_CLOCK_CONTROL);
++	if (!(clk & CLK_INT_EN)) {
++		wr16(hc, SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_INT_EN));
++		for (int i = 0; i < 2000 && !(rd16(hc, SDHCI_CLOCK_CONTROL) & CLK_INT_STABLE); i++) {
++			delay(10);
++		}
++		clk = rd16(hc, SDHCI_CLOCK_CONTROL);
++	}
++	if (!(clk & CLK_SD_EN)) {
++		wr16(hc, SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_SD_EN));
++	}
++	/* Polled: latch every status bit, raise no interrupt */
++	wr32(hc, SDHCI_SIGNAL_ENABLE, 0);
++	wr32(hc, SDHCI_INT_ENABLE, 0xffffffff);
++	dump_regs("SDHCI mode on");
++
++	int error = mmc_wake();
++	if (error) {
++		printf("gtel mmc: card not in transfer state (%d), giving up\n", error);
++		return;
++	}
++	mmc_print_gpt();
++}
++
++void gtel_mmc_probe(void);
++
++void
++gtel_mmc_probe(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("gtelmmc", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(gtel_mmc_probe_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 6c98e25..60038b8 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6906,6 +6906,9 @@ load_init_program(proc_t p)
+ 	/* sweet starts the sampler from its UFS probe; gtel has no UFS */
+ 	extern void sweet_sample_start(void);
+ 	sweet_sample_start();
++	/* gtel: probe the internal eMMC (read-only, logs the GPT) */
++	extern void gtel_mmc_probe(void);
++	gtel_mmc_probe();
+ #endif
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
