@@ -300,6 +300,7 @@ static void execute_line(char *line) {
         puts("  spawn <path>    Spawn binary with posix_spawn");
         puts("  echo <text>     Print text");
         puts("  sleep <secs>    Pause (time to take a photo)");
+        puts("  spin <M>        Busy-wait M million loops (no timer needed)");
         puts("  clear           Blank the screen");
         puts("  sync            Sync filesystems");
         puts("  reboot          Reboot device");
@@ -321,6 +322,11 @@ static void execute_line(char *line) {
         puts("");
     } else if (strcmp(toks[0], "sleep") == 0) {
         sleep(ntoks > 1 ? parse_uint(toks[1]) : 1);
+    } else if (strcmp(toks[0], "spin") == 0) {
+        /* Busy-wait that needs no timer interrupt, unlike sleep */
+        unsigned long n = (unsigned long)(ntoks > 1 ? parse_uint(toks[1]) : 100) * 1000000UL;
+        for (volatile unsigned long i = 0; i < n; i++) { }
+        puts("spin done");
     } else if (strcmp(toks[0], "clear") == 0) {
         cmd_clear();
     } else if (strcmp(toks[0], "sync") == 0) {
