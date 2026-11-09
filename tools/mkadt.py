@@ -15,7 +15,7 @@ import adt  # noqa: E402
 # and continuous splash FB (0x8e000000).
 # Free contiguous RAM starts safely at 0x90000000 through 0xdf000000 (~1.25 GB).
 PHYS_BASE = 0x90000000
-MEM_SIZE  = 0x40000000   # 1 GiB: 0x90000000-0xd0000000, clear of lk2nd/TZ below and the top of RAM
+MEM_SIZE  = 0x20000000   # 512 MiB: 0x90000000-0xb0000000; 0xb0000000+ is a protected carveout (external abort at 0xb0020000)
 PANIC_LOG_SIZE = 0x100000
 
 # MSM8916 Hardware MMIO addresses
@@ -77,7 +77,12 @@ def build(target='ipad'):
         ('system-firmware-version', cstr('lk2nd-gtel-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
         ('crypto-hash-method', cstr('sha2-384')),
-        ('display-scale', u32(1)),
+        ('board-id', u32(2)),
+        ('chip-id', u32(0x8960)),
+        ('unique-chip-id', u64(GTEL_ECID)),
+        ('die-id', u64(GTEL_ECID)),
+        ('display-corner-radius', u32(0)),
+        ('display-scale', u32(2)),
         ('display-rotation', u32(0)),
     ], [
         node('memory-map', [ph()]),
@@ -129,6 +134,8 @@ def build(target='ipad'):
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+        ('soc-generation', cstr('H6')),
+        ('chip-revision', u32(0)),
     ], [
         gic,
         uart,
@@ -159,7 +166,92 @@ def build(target='ipad'):
         ('home-button-type', u32(0)), # Physical home button
     ])
 
-    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+    defaults = node('defaults', [
+        ph(),
+        ('no-effaceable-storage', u32(1)),
+        ('panic-reset-type', u32(1)),
+        ('kern.maxvnodes', u32(3700)),
+        ('kern.maxkfsevents', u32(1024)),
+        ('kern.max_task_pmem', u32(700)),
+        ('kern.io_throttle_period_tier3', u32(20)),
+        ('kern.io_throttle_window_tier3', u32(100)),
+        ('kern.hibernation_min_processes', u32(4)),
+        ('kern.vm_compressor', u32(32)),
+        ('cpx-encryption-mode', u32(0)),
+    ])
+
+    # Authentic iPad mini 2 (iPad4,4 / J85AP) Product Configuration
+    camera = node('camera', [
+        ph(),
+        ('front-max-video-fps-720p', u32(30)),
+        ('front-burst-image-duration', u32(100)),
+        ('post-effects', u32(1)),
+        ('auto-focus', u32(1)),
+        ('rear-max-video-fps-1080p', u32(30)),
+        ('panorama', u32(1)),
+        ('front-max-video-zoom', u32(1)),
+        ('rear-max-video-zoom', u32(3)),
+        ('rear-hdr-on', u32(1)),
+        ('video-cap', u32(2)),
+        ('rear-burst-image-duration', u32(100)),
+        ('rear-hdr', u32(1)),
+        ('rear-max-video-fps-720p', u32(30)),
+    ])
+    facetime = node('facetime', [
+        ph(),
+        ('tnr-mode-back', u32(10)),
+        ('decoding', b'@\x01\x00\x00\x0f\x00\xf0\x00\xe0\x01\x00\x00\x0f\x00p\x01\x80\x02\x00\x00\x1e\x00\xe0\x01\x00\x04\x00\x00\x1e\x00\x00\x03'),
+        ('tnr-mode-front', u32(10)),
+        ('pref-decoding', b'\x00\x04\x00\x00\x1e\x00\x00\x03'),
+        ('bitrate-wifi', u32(2000)),
+        ('encoding', b'@\x01\x00\x00\x0f\x00\xf0\x00@\x01\x00\x00\x1e\x00\xf0\x00\xe0\x01\x00\x00\x0f\x00p\x01\xe0\x01\x00\x00\x1e\x00p\x01\x80\x02\x00\x00\x1e\x00\xe0\x01\x00\x04\x00\x00\x1e\x00\x00\x03\x00\x05\x00\x00\x1e\x00\xd0\x02'),
+    ])
+    maps = node('maps', [
+        ph(),
+        ('3d-imagery', u32(0)),
+        ('3d-maps', u32(0)),
+    ])
+    product = node('product', [
+        ph(),
+        ('graphics-featureset-fallbacks', cstr('GLES2,0')),
+        ('device-perf-memory-class', u32(1)),
+        ('artwork-device-subtype', u32(0)),
+        ('product-description', cstr('iPad mini 2')),
+        ('display-mirroring', u32(1)),
+        ('builtin-mics', u32(2)),
+        ('allow-32bit-apps', u32(1)),
+        ('compatible-device-fallback', cstr('0')),
+        ('mobiledevice-beta-min-ver', cstr('0.0.0.0.0')),
+        ('hearingaid-low-energy-audio', u32(1)),
+        ('device-color-policy', u32(0)),
+        ('iap2-protocol-supported', u32(1)),
+        ('sandman-support', u32(0)),
+        ('itunes-min-ver', b'\x02\x02\x0c\x00'),
+        ('RF-exposure-separation-distance', u32(5)),
+        ('single-stage-boot', u32(0)),
+        ('peek-ui-width', u32(346)),
+        ('ui-background-quality', u32(100)),
+        ('graphics-featureset-class', cstr('MTL1,2')),
+        ('ui-pip', b''),
+        ('mobiledevice-min-ver', cstr('988.200.73')),
+        ('ui-traffic-cheap-shaders', b''),
+        ('wifi-chipset', cstr('4324')),
+        ('ui-weather-quality', u32(100)),
+        ('ptp-large-files', u32(1)),
+        ('artwork-dynamic-displaymode', cstr('0')),
+        ('assistant', u32(1)),
+        ('product-name', cstr('iPad mini 2')),
+        ('product-id', b'b\xa3\x0fq\xd8mDt\xe4\x11\xe4z\x95\\\x17R|\xc1\xaej'),
+        ('bluetooth-le', u32(1)),
+        ('thin-bezel', u32(1)),
+        ('dictation', u32(1)),
+        ('lockdown-certtype', u32(1)),
+        ('device-colors', cstr('syscfg/DClr')),
+        ('udid-version', u32(1)),
+        ('artwork-scale-factor', u32(2)),
+        ('artwork-device-idiom', cstr('pad')),
+        ('artwork-display-gamut', cstr('sRGB')),
+    ], [camera, facetime, maps])
 
     # Target identity: default iPad mini 2 (iPad4,4 / J85AP) or iPhone 6 (iPhone7,2 / N61AP)
     if target == 'iphone':
@@ -178,9 +270,15 @@ def build(target='ipad'):
         ('target-type', cstr(target_name)),
         ('target-sub-type', cstr(board_id)),
         ('manufacturer', cstr('Apple Inc.')),
+        ('serial-number', cstr('DLXLT001FCM5')),
+        ('model-number', cstr('ME276LL/A')),
+        ('regulatory-model-number', cstr('A1489')),
+        ('region-info', cstr('LL/A')),
+        ('mlb-serial-number', cstr('DLX4123001AFCM5A1')),
+        ('config-number', cstr('ME276')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons])
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, product])
 
 
 if __name__ == '__main__':
