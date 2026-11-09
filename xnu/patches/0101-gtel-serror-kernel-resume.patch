@@ -30,7 +30,7 @@ diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 -static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
 -static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
 +static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
-+static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint32_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
++static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
 +static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
  
  static void dump_regs(const char *when);
