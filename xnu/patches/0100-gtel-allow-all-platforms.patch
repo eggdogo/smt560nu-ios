@@ -1,0 +1,39 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7406,10 +7406,12 @@
+ 			}
+ #endif /* DEBUG || DEVELOPMENT */
+ 			if (!no_sandbox_entitled) {
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
+ 				goto done;
++#endif
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+@@ -7420,14 +7422,22 @@
+ 			    "boot-arg set to true\n", p->p_name);
+ #endif
+ 		} else if (psa->psa_platform != PLATFORM_IOS) {
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* Simulator binary spawned with wrong platform */
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 			    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 			error = EACCES;
+ 			goto done;
++#else
++			printf("exec %s\n", p->p_name);
++#endif
+ 		} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("exec %s\n", p->p_name);
++#else
+ 			printf("Allowing spawn of iOS binary %s since correct platform was passed in spawn\n",
+ 			    p->p_name);
++#endif
+ 		}
+ 	}
+ #endif /* XNU_TARGET_OS_OSX */

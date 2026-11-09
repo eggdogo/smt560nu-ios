@@ -1,0 +1,37 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -420,6 +420,7 @@
+ 	    async ? "SError" : "sync external abort", user ? "user" : "KERNEL", name,
+ 	    get_saved_state_pc(state), get_saved_state_lr(state), cpsr, esr, (uint64_t)far);
+ 	if (!user) {
++		printf("SWEET %s in kernel mode from %s, ignoring and resuming\n", async ? "SError" : "abort", name);
+ 		return;
+ 	}
+ 	mach_exception_data_type_t codes[2] = { KERN_INVALID_ADDRESS, (mach_exception_data_type_t)far };
+@@ -489,6 +490,9 @@
+ 	} else {
+ #if defined(SWEET)
+ 		sweet_platform_error(state, esr, far, source == PLAT_ERR_SRC_ASYNC);
++		if (source == PLAT_ERR_SRC_ASYNC) {
++			return;
++		}
+ #endif
+ 		arm64_implementation_specific_error(state, esr, far);
+ 	}
+diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
+--- a/bsd/dev/gtel_sdhci.c
++++ b/bsd/dev/gtel_sdhci.c
+@@ -93,9 +93,9 @@
+ static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+ static inline uint16_t rd16(vm_offset_t b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
+ static inline uint8_t rd8(vm_offset_t b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
+-static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
+-static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
+-static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
++static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint32_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
++static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
+ 
+ static void dump_regs(const char *when);
+ 
