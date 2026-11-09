@@ -11,7 +11,7 @@ index ff9c2f8..5d5b828 100644
 +	 * the caller's user address: copy through copyin/copyout, since PAN
 +	 * faults a plain memcpy to it.
 +	 */
-+	bool user = (vm_offset_t)vaddr < VM_MIN_KERNEL_ADDRESS;
++	bool user = ((vm_offset_t)vaddr >> 63) == 0;
 +
  	lck_mtx_lock(&sweet_ufs_lock);
  	for (uint32_t done = 0; done < count;) {

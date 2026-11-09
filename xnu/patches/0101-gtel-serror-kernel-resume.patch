@@ -23,12 +23,15 @@ diff --git a/bsd/dev/gtel_sdhci.c b/bsd/dev/gtel_sdhci.c
 --- a/bsd/dev/gtel_sdhci.c
 +++ b/bsd/dev/gtel_sdhci.c
 @@ -93,9 +93,9 @@
- static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
- static inline uint16_t rd16(vm_offset_t b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
- static inline uint8_t rd8(vm_offset_t b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
+-static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+-static inline uint16_t rd16(vm_offset_t b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
+-static inline uint8_t rd8(vm_offset_t b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
 -static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
 -static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
 -static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { uint32_t v = *(volatile uint32_t *)(b + o); __builtin_arm_dsb(0xf); return v; }
++static inline uint16_t rd16(vm_offset_t b, uint32_t o) { uint16_t v = *(volatile uint16_t *)(b + o); __builtin_arm_dsb(0xf); return v; }
++static inline uint8_t rd8(vm_offset_t b, uint32_t o) { uint8_t v = *(volatile uint8_t *)(b + o); __builtin_arm_dsb(0xf); return v; }
 +static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
 +static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
 +static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; __builtin_arm_dsb(0xf); }
