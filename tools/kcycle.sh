@@ -30,7 +30,7 @@ cat xnu_build/*.lse.txt
 if [ -n "$MUST" ]; then grep -q "$MUST" xnu_build/kernel.development.sweet || { echo "kernel lacks '$MUST'"; exit 1; }; fi
 cp xnu_build/kernel.development.sweet kernel.development.sweet
 
-bash tools/local_pack.sh kernel.development.sweet shim-boot.img | tail -1
+RD=${RD:-ufsroot0} EXTRA=${EXTRA:-"sweetsample=launchd ufsrw=1 nointr_consio=1"} bash tools/local_pack.sh kernel.development.sweet shim-boot.img | tail -1
 if timeout 10 python tools/pyfastboot.py getvar product 2>/dev/null | grep -q lk2nd; then
   python tools/pyfastboot.py boot shim-boot.img
 else

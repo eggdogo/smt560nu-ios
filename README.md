@@ -2,7 +2,21 @@
 
 Booting Apple Darwin XNU and iOS on the Samsung Galaxy Tab E 9.6 (`SM-T560NU` / `gtelwifiue`).
 
-Targeting **iOS 12.5.7** (`16H81`, iPad mini 2 `iPad4,4` / `J85AP` userland) and **Darwin XNU** (`xnu-8796` / `xnu-4903`).
+Targeting **iOS 12.5.7** (`16H81`, iPad mini 2 `iPad4,4` / `J85AP` userland) and **Darwin XNU** (`xnu-8796.141.3`, macOS 13.5 era).
+
+---
+
+## Current Status & Capabilities
+
+* **Boot Chain**: Samsung PBL -> SBL -> QSEE (TZ) -> LK (`lk2nd-msm8916`) -> Bootloader Shim -> Darwin XNU (EL1).
+* **4KB MMU Translation**: Full 4KB page table translation for ARM Cortex-A53 (`__ARM_16K_PG__ = 0`, `TGran4`).
+* **eMMC 5.0 SDHCI Storage**: Direct polled PIO driver (`bsd/dev/gtel_sdhci.c`) accessing MSM8916 SDHCI1. Reads, writes, and GPT partition parsing.
+* **Native Root Filesystem**: Boots from the internal eMMC `userdata` partition (~12 GB) formatted as HFS+ (`rd=ufsroot0 ufsrw=1`), aliased as `/dev/disk0s1`.
+* **ARMv8 Crypto Emulation**: Kernel EL0 emulation for ARMv8.0 Crypto Extensions (`AESE`, `AESD`, `AESMC`, `AESIMC`, `SHA1`, `SHA256`, `PMULL`), allowing Apple cryptographic frameworks and `cc_fips_test` to run and pass 100%.
+* **Kernel decmpfs ZLIB**: In-kernel decompression for HFS+ compressed files (decmpfs types 3 & 4).
+* **dyld & Userland Execution**: Restored BSD syscall 438 (`shared_region_check_np`) and SIP bypass for dyld shared cache on HFS+.
+* **System Services**: `launchd` (PID 1) completes early boot (`"Early boot complete. Continuing system boot."`) and spawns iOS system daemons including `SpringBoard`, `backboardd`, `keybagd`, `lockdownd`, `mediaserverd`, and `wifid`.
+* **Console Log Extraction**: 4 MiB in-memory ring buffer (`_sweet_log_ring`) survives warm reboot into `lk2nd` and can be pulled over USB fastboot via `tools/pull_log.py`.
 
 ---
 
@@ -16,9 +30,9 @@ Targeting **iOS 12.5.7** (`16H81`, iPad mini 2 `iPad4,4` / `J85AP` userland) and
 | **RAM** | 1.5 GB LPDDR3 (Base `0x80000000`, Usable ~1,439 MB) |
 | **Display** | Novatek NT51017 MIPI DSI Video Mode (800×1280 portrait, 24bpp RGB888, stride 2400) |
 | **Framebuffer** | Continuous Splash Base `0x8e000000` |
-| **Interrupt Controller** | ARM GIC-400 (GICv2) @ `0x0b000000` (GICD) / `0x0b0b2000` (GICC) |
+| **Interrupt Controller** | ARM GIC-400 (GICv2) @ `0x0b000000` (GICD) / `0x0b002000` (GICC) |
 | **Timers** | ARMv8 Generic Architected Timer (`CNTV`, Virtual PPI INTID 27) |
-| **Boot Chain** | Samsung PBL -> SBL -> QSEE (TZ) -> LK (`lk2nd`) -> Bootloader Shim -> Darwin XNU |
+| **Storage** | 16 GB eMMC 5.0 (MSM8916 SDHCI1 @ `0x07824000`) |
 
 ---
 
@@ -37,38 +51,54 @@ Targeting **iOS 12.5.7** (`16H81`, iPad mini 2 `iPad4,4` / `J85AP` userland) and
 
 ## Repository Structure
 
-* `.github/workflows/xnu.yml`: Automated GitHub Actions workflow to build Darwin XNU on macOS arm64 runners.
-* `xnu/patches/`: Modular patchset adapting open-source XNU for Qualcomm MSM8916 hardware.
-* `shim/`: Bare-metal AArch64 bootloader shim that parses Apple Mach-O binaries, sets up ADT/boot-args, and jumps into XNU.
+* `.github/workflows/`:
+  * `xnu.yml`: GitHub Actions automated Darwin XNU build on macOS arm64 runners.
+  * `pack.yml`: Automated boot image packaging (`shim-boot.img`).
+  * `rootfs.yml`: Creates the 10 GB iOS 12.5.7 HFSX root filesystem image.
+* `xnu/patches/`: Over 100 modular patches adapting XNU 8796 for MSM8916 hardware.
+* `shim/`: Bare-metal AArch64 bootloader shim that loads Mach-O segments, sets up ADT/boot-args, and enters XNU.
 * `tools/`:
-  * `pyfastboot.py`: LibUSB-based fastboot protocol client.
-  * `mkadt.py`: Apple Device Tree generator for GTEL (`iPad4,4` profile).
+  * `kcycle.sh`: Fast kernel cycle (waits for CI build of commit, fetches artifact, packs locally, boots device).
+  * `local_pack.sh`: Local packaging of `shim-boot.img` using cached ADT, shim, and ramdisk/eMMC boot-args.
+  * `flash_rootfs.py`: Streams raw HFS filesystem images to the eMMC `userdata` partition as sparse chunks through fastboot.
+  * `pull_log.py`: Extracts the kernel console log from DRAM after warm-rebooting into fastboot.
+  * `pyfastboot.py`: LibUSB fastboot protocol client.
+  * `mkadt.py`: Apple Device Tree generator (`iPad4,4` / GTEL profile).
   * `mkpayload.py`: Packages Mach-O + ADT + boot-args + ramdisk into flat `GTELXNU` payload.
   * `pack_bootimg.py`: Android boot.img v0 packer for `fastboot boot`.
-  * `gtel_root_tweaks.py`: Applies bringup tweaks to iOS rootfs/ramdisk (bypasses PurpleBuddy, disables watchdogs).
 
 ---
 
 ## Building and Booting
 
-### 1. Build the Darwin XNU Kernel
-The kernel builds automatically via GitHub Actions:
-1. Navigate to the **Actions** tab in this repository.
-2. Select **xnu**, click **Run workflow**, and set `machine_config` to `GTEL`.
-3. Download the compiled `xnu-kernel` artifact (`kernel.development.gtel`).
-
-### 2. Package the Boot Image
+### 1. Flash the iOS 12.5.7 Rootfs to eMMC (One-time Setup)
+Download the `ios12-rootfs.hfs` image generated by `rootfs.yml` and flash it to the `userdata` partition:
 ```bash
-python tools/mkadt.py -o gtel.adt
-python tools/mkpayload.py kernel.development.gtel gtel.adt payload.bin \
-  --ramdisk ramdisk.dmg \
-  --cmdline "debug=0x14e serial=0x3 cpus=1 gtel_fbcon=1 keepsyms=1 rd=md0"
-
-bash shim/build.sh payload.bin
+python tools/flash_rootfs.py ios12-rootfs.hfs userdata
 ```
 
-### 3. Boot Device via Fastboot
+### 2. Build the Darwin XNU Kernel
+Pushing changes to `xnu/patches/` automatically triggers the GitHub Actions workflow `.github/workflows/xnu.yml`.
+
+To wait for CI, fetch the kernel artifact, pack `shim-boot.img`, and boot the device automatically:
+```bash
+bash tools/kcycle.sh <commit_sha>
+```
+
+### 3. Manual Local Packaging
+To manually package `shim-boot.img` for eMMC boot:
+```bash
+RD=ufsroot0 EXTRA="sweetsample=launchd ufsrw=1 nointr_consio=1" bash tools/local_pack.sh kernel.development.sweet shim-boot.img
+```
+
+### 4. Boot Device via Fastboot
 With the tablet connected in `lk2nd` fastboot mode:
 ```bash
-python tools/pyfastboot.py boot shim/out/shim-boot.img
+python tools/pyfastboot.py boot shim-boot.img
+```
+
+### 5. Pull Kernel Console Log
+After a warm reboot back to `lk2nd`:
+```bash
+python tools/pull_log.py -o console_log.txt
 ```
