@@ -1,0 +1,52 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index c4ffe72..222c757 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -398,6 +398,37 @@ arm64_implementation_specific_error(arm_saved_state_t *state, uint32_t esr, vm_o
+ 	panic_plain("Unhandled implementation specific error\n");
+ }
+ 
++#if defined(SWEET)
++extern char *proc_name_address(void *p);
++extern void *get_bsdtask_info(task_t);
++
++/*
++ * gtel: an external abort / SError has no Apple platform handler here.
++ * Log who caused it; if it came from user space, kill that process with
++ * EXC_BAD_ACCESS instead of panicking the whole system.
++ * Returns only when the error was from the kernel (caller then panics).
++ */
++static void
++sweet_platform_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far, bool async)
++{
++	uint32_t cpsr = get_saved_state_cpsr(state);
++	bool user = PSR64_IS_USER(cpsr);
++	void *bsd = get_bsdtask_info(current_task());
++	const char *name = bsd ? proc_name_address(bsd) : "?";
++
++	printf("SWEET %s error: %s %s pc 0x%llx lr 0x%llx cpsr 0x%x esr 0x%x far 0x%llx\n",
++	    async ? "SError" : "sync external abort", user ? "user" : "KERNEL", name,
++	    get_saved_state_pc(state), get_saved_state_lr(state), cpsr, esr, (uint64_t)far);
++	if (!user) {
++		return;
++	}
++	mach_exception_data_type_t codes[2] = { KERN_INVALID_ADDRESS, (mach_exception_data_type_t)far };
++	ml_set_interrupts_enabled(TRUE);
++	exception_triage(EXC_BAD_ACCESS, codes, 2);
++	/* NOTREACHED */
++}
++#endif
++
+ #if CONFIG_KERNEL_INTEGRITY
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wunused-parameter"
+@@ -456,6 +487,9 @@ arm64_platform_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far, pl
+ 	} else if (cdp->platform_error_handler != NULL) {
+ 		cdp->platform_error_handler(cdp->cpu_id, far);
+ 	} else {
++#if defined(SWEET)
++		sweet_platform_error(state, esr, far, source == PLAT_ERR_SRC_ASYNC);
++#endif
+ 		arm64_implementation_specific_error(state, esr, far);
+ 	}
+ }
