@@ -1,0 +1,175 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..7d03883 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -162,15 +162,15 @@ AppleCLCD::start(IOService *provider)
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+-	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
++	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 3) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	int logical = 0;
++	PE_parse_boot_argn("sweetfb_logical", &logical, sizeof(logical));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (logical && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+@@ -178,7 +178,8 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes,
++	    fRowBytes == fWidth * 3 ? 0x32344752 : SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+@@ -200,6 +201,8 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	setProperty("primary-display", true);
++	setProperty("display-type", 1ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -232,10 +235,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++			if (fb->fRowBytes == fb->fWidth * 3) {
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint8_t *row = (volatile uint8_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth * 3; x++) {
++						row[x] = step < 6 ? (row[x] >> 1) : 0;
++					}
++				}
++			} else {
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth; x++) {
++						row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++					}
+ 				}
+ 			}
+ 		}
+@@ -391,10 +403,22 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (fRowBytes == fWidth * 3) {
++				for (int32_t y = 0; y < h; y++) {
++					volatile uint8_t *dst = (volatile uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 3);
++					const uint8_t *spx = (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++					for (int32_t x = 0; x < w; x++) {
++						dst[x * 3 + 0] = spx[x * 4 + 2]; /* R */
++						dst[x * 3 + 1] = spx[x * 4 + 1]; /* G */
++						dst[x * 3 + 2] = spx[x * 4 + 0]; /* B */
++					}
++				}
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
+ 		}
+ 		s->release();
+@@ -503,7 +527,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	}
+ 	case kSweetFBGetID:
+-		out[0] = 0;
++		out[0] = 1;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDisplaySize:
+@@ -516,7 +540,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = 157; /* SM-T560NU ~157 PPI */
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
+@@ -547,6 +571,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBSwapWait:
+ 	default:
++		if (args->scalarOutputCount == 1) {
++			out[0] = 1; /* non-zero display type/id for queries like s_map_display_type */
++			outCount = 1;
++		}
+ 		break;
+ 	}
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..b6581ce 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -235,7 +235,7 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	s->width = width;
+ 	s->height = height;
+ 	s->bytesPerRow = bytesPerRow;
+-	s->bytesPerElement = 4;
++	s->bytesPerElement = (bytesPerRow >= width * 4) ? 4 : 3;
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = pixelFormat;
+ 	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c2b41a2..5f5ac4a 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -65,7 +65,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'sweet,display';"
++    "     'IONameMatch'     = ('sweet,display', 'gtel,display');"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index b1dcbcf..3ae03e8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -420,8 +420,9 @@ sweet_platform_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far, bo
+ 	    async ? "SError" : "sync external abort", user ? "user" : "KERNEL", name,
+ 	    get_saved_state_pc(state), get_saved_state_lr(state), cpsr, esr, (uint64_t)far);
+ 	if (!user) {
+-		printf("SWEET %s in kernel mode from %s, ignoring and resuming\n", async ? "SError" : "abort", name);
+-		return;
++		panic("SWEET %s in kernel mode from %s (pc 0x%llx lr 0x%llx esr 0x%llx far 0x%llx)",
++		    async ? "SError" : "sync external abort", name,
++		    get_saved_state_pc(state), get_saved_state_lr(state), esr, (uint64_t)far);
+ 	}
+ 	mach_exception_data_type_t codes[2] = { KERN_INVALID_ADDRESS, (mach_exception_data_type_t)far };
+ 	ml_set_interrupts_enabled(TRUE);
+@@ -490,9 +491,6 @@ arm64_platform_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far, pl
+ 	} else {
+ #if defined(SWEET)
+ 		sweet_platform_error(state, esr, far, source == PLAT_ERR_SRC_ASYNC);
+-		if (source == PLAT_ERR_SRC_ASYNC) {
+-			return;
+-		}
+ #endif
+ 		arm64_implementation_specific_error(state, esr, far);
+ 	}

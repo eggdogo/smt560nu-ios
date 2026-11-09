@@ -136,7 +136,7 @@ def build(target='ipad'):
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr('gtel,display')),
+            ('compatible', cstr('gtel,display') + cstr('sweet,display')),
             ('canvas-width', u32(FB_W)),
             ('canvas-height', u32(FB_H)),
         ])
