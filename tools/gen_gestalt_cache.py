@@ -9,6 +9,8 @@ import os, plistlib, re, struct, sys
 BUILD_VERSION = "16H81"
 CACHE_UUID = "34156B22-E548-4F28-827E-7FDBA7A2CF33"
 CACHE_DATA_LEN = 3780  # 0xec4 bytes
+# Local working tree holding mapping-gestalt.h and the extracted 16H81 ramdisk
+PROJECT_DIR = os.path.expanduser(os.path.join("~", "Documents", "Projects", "iosont560nu"))
 
 def load_precacheable_keys():
     """Load all valid precacheable question mappings."""
@@ -17,9 +19,10 @@ def load_precacheable_keys():
     
     # Try mapping-gestalt.h
     h_path = os.path.join(proj_dir, "mapping-gestalt.h")
-    if not os.path.exists(h_path):
-        h_path = os.path.join(cur_dir, "mapping-gestalt.h")
-    
+    for cand in (os.path.join(cur_dir, "mapping-gestalt.h"), os.path.join(PROJECT_DIR, "mapping-gestalt.h")):
+        if not os.path.exists(h_path):
+            h_path = cand
+
     with open(h_path) as f:
         obf_to_clear = dict(re.findall(r'"([^"]+)",\s*"([^"]+)"', f.read()))
     clear_to_obf = {v: k for k, v in obf_to_clear.items()}
@@ -128,7 +131,7 @@ def build_cache_extra(clear_to_obf):
         "ContinuityCapability": True,
         "iAP2Capability": True,
         "wapi": False,
-        "WLANBkgScanCache": True,
+        "WLANBkgScanCache": 1,
         "telephony": False,
         "any-telephony": False,
         "data-plan": False,
@@ -192,15 +195,61 @@ def build_cache_extra(clear_to_obf):
 
     return cache_extra
 
-def generate_plist(out_path):
+# libMobileGestalt (16H81) question table: __DATA_CONST 0x3c9e8, 0x69c slots of 0xa0 bytes.
+# +0x00 key name ptr, +0x98 flags (0x10 = precacheable), +0x9a int16 cache index, +0x9c int32 type.
+MG_TABLE, MG_SLOTS, MG_STRIDE = 0x3c9e8, 0x69c, 0xa0
+N_INDEX = 0x1a4               # CacheData = N_INDEX 8-byte value slots + N_INDEX "present" bytes
+# The loader memcpy()s CacheData into its fast table and reads scalars back raw
+# (store routine at 0x453c): 5 = SInt32, 6 = SInt64, 7 = Float32, 11 = bool byte.
+# Every other type is a CF object and must come from CacheExtra, which is stored as a
+# retained pointer -- so a scalar placed in CacheExtra would read back as pointer bits.
+SCALAR = {5: '<i', 6: '<q', 7: '<f', 11: '<B'}
+DEFAULT_DYLIB = os.path.join(PROJECT_DIR, 'ramdisk_extracted', 'PeaceUpdate16H81.arm64CustomerRamDisk',
+    'usr', 'lib', 'libMobileGestalt.dylib')
+
+
+def load_question_table(dylib):
+    d = open(dylib, 'rb').read()
+    table = {}
+    for k in range(MG_SLOTS):
+        e = d[MG_TABLE + k * MG_STRIDE:MG_TABLE + (k + 1) * MG_STRIDE]
+        if not any(e):
+            continue
+        p = struct.unpack_from('<Q', e, 0)[0] & 0xffffffff
+        name = d[p:d.index(b'\0', p)].decode()
+        table[name] = (e[0x98], struct.unpack_from('<h', e, 0x9a)[0], struct.unpack_from('<i', e, 0x9c)[0])
+    return table
+
+
+def generate_plist(out_path, dylib=DEFAULT_DYLIB):
     """Generate the complete com.apple.MobileGestalt.plist binary file."""
-    _, clear_to_obf = load_precacheable_keys()
-    cache_extra = build_cache_extra(clear_to_obf)
+    obf_to_clear, clear_to_obf = load_precacheable_keys()
+    answers = build_cache_extra(clear_to_obf)
+    table = load_question_table(dylib)
+
+    data = bytearray(CACHE_DATA_LEN)
+    cache_extra = {}
+    for obf, val in answers.items():
+        flags, idx, ty = table.get(obf, (0, -1, 0))
+        name = obf_to_clear.get(obf, obf)
+        if not flags & 0x10 or not 0 <= idx < N_INDEX:
+            sys.exit(f"{name} is not precacheable: one such key invalidates the whole cache")
+        if ty in SCALAR:
+            if ty == 11 and not isinstance(val, bool):
+                sys.exit(f"{name} is a bool question, got {val!r}")
+            if ty in (5, 6) and (isinstance(val, bool) or not isinstance(val, int)):
+                sys.exit(f"{name} is an integer question, got {val!r}")
+            struct.pack_into(SCALAR[ty], data, idx * 8, val)
+            data[N_INDEX * 8 + idx] = 1
+        else:
+            if isinstance(val, (bool, int, float)) and ty != 4:
+                sys.exit(f"{name} (type {ty}) needs a CF object, got {val!r}")
+            cache_extra[obf] = val
 
     cache_dict = {
         "CacheVersion": BUILD_VERSION,
         "CacheUUID": CACHE_UUID,
-        "CacheData": b"\x00" * CACHE_DATA_LEN,
+        "CacheData": bytes(data),
         "CacheExtra": cache_extra,
     }
 
@@ -208,8 +257,10 @@ def generate_plist(out_path):
         plistlib.dump(cache_dict, f, fmt=plistlib.FMT_BINARY)
 
     size = os.path.getsize(out_path)
-    print(f"Generated {out_path} ({size} bytes, {len(cache_extra)} precached properties)")
+    n_data = sum(data[N_INDEX * 8:])
+    print(f"Generated {out_path} ({size} bytes): {n_data} scalars in CacheData, "
+          f"{len(cache_extra)} objects in CacheExtra")
 
 if __name__ == "__main__":
     out_file = sys.argv[1] if len(sys.argv) > 1 else "com.apple.MobileGestalt.plist"
-    generate_plist(out_file)
+    generate_plist(out_file, *sys.argv[2:3])

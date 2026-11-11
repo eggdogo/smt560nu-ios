@@ -1,0 +1,29 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9900,6 +9900,26 @@
+ 	           UIO_USERSPACE);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: mkdir from kernel context with a kernel-space path, for early-boot
++ * seeding of files whose parent directories the stock rootfs lacks.
++ */
++int sweet_kernel_mkdir(const char *path, int mode);
++
++int
++sweet_kernel_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va,
++	           AT_FDCWD, UIO_SYSSPACE);
++}
++#endif
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)

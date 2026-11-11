@@ -22,8 +22,24 @@ c_array_str = "\n".join(hex_lines)
 patch_code = f"""#if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/fcntl.h>
 
+extern int sweet_kernel_mkdir(const char *path, int mode);
+
 static const uint8_t sweet_gestalt_plist[{len(plist_bytes)}] = {{
 {c_array_str}
+}};
+
+/*
+ * libMobileGestalt's cache loader only ever opens the systemgroup container
+ * copy of the cache; /var/mobile/Library/Caches is only a legacy check.
+ * containermanagerd never ran on this rootfs, so create the path ourselves.
+ */
+static const char *const sweet_gestalt_dirs[] = {{
+\t"/private/var/containers",
+\t"/private/var/containers/Shared",
+\t"/private/var/containers/Shared/SystemGroup",
+\t"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache",
+\t"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library",
+\t"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches",
 }};
 
 static void
@@ -31,16 +47,8 @@ sweet_inject_gestalt_cache(void)
 {{
 \tvnode_t vp = NULLVP;
 \tvfs_context_t ctx = vfs_context_kernel();
-\tconst char *path = "/private/var/mobile/Library/Caches/com.apple.MobileGestalt.plist";
-
-\tif (vnode_open(path, FREAD, 0, 0, &vp, ctx) == 0) {{
-\t\tprintf("SWEET: MobileGestalt cache already present at %s\\n", path);
-\t\tvnode_close(vp, FREAD, ctx);
-\t\treturn;
-\t}}
-
-\tprintf("SWEET: Injecting authentic iPad4,4 MobileGestalt cache to %s (%lu bytes)...\\n",
-\t    path, (unsigned long)sizeof(sweet_gestalt_plist));
+\tconst char *path = "/private/var/containers/Shared/SystemGroup/"
+\t    "systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
 
 \tmount_t mp = rootvnode ? rootvnode->v_mount : NULL;
 \tuint64_t saved_flags = 0;
@@ -48,6 +56,17 @@ sweet_inject_gestalt_cache(void)
 \t\tsaved_flags = mp->mnt_flag;
 \t\tmp->mnt_flag &= ~MNT_RDONLY;
 \t}}
+
+\tfor (size_t i = 0; i < sizeof(sweet_gestalt_dirs) / sizeof(sweet_gestalt_dirs[0]); i++) {{
+\t\tint merr = sweet_kernel_mkdir(sweet_gestalt_dirs[i], 0755);
+\t\tif (merr != 0 && merr != EEXIST) {{
+\t\t\tprintf("SWEET: mkdir %s failed (errno %d)\\n", sweet_gestalt_dirs[i], merr);
+\t\t}}
+\t}}
+
+\t/* Always rewrite: an older, wrongly encoded cache may already be on disk. */
+\tprintf("SWEET: Writing iPad4,4 MobileGestalt cache to %s (%lu bytes)...\\n",
+\t    path, (unsigned long)sizeof(sweet_gestalt_plist));
 
 \tint error = vnode_open(path, (O_CREAT | FWRITE | O_TRUNC | O_NOFOLLOW), 0644, 0, &vp, ctx);
 \tif (error == 0) {{
@@ -59,7 +78,7 @@ sweet_inject_gestalt_cache(void)
 \t\t(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
 \t\tvnode_close(vp, FWRITE, ctx);
 \t\tif (err == 0) {{
-\t\t\tprintf("SWEET: MobileGestalt cache injected successfully!\\n");
+\t\t\tprintf("SWEET: MobileGestalt cache written successfully!\\n");
 \t\t}} else {{
 \t\t\tprintf("SWEET: MobileGestalt cache write failed with errno %d\\n", err);
 \t\t}}
