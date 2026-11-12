@@ -1,4 +1,4 @@
-# Handoff: iOS 12.5.7 on Galaxy Tab E (SM-T560NU), 2026-11-09
+# Handoff: iOS 12.5.7 on Galaxy Tab E (SM-T560NU), 2026-11-12
 
 ## How to talk to egg (the user)
 Please follow egg's style rules in every reply:
@@ -24,54 +24,97 @@ Roadmap:
 
 ---
 
-## What Was Done Tonight
-1. **Authentic `iPad4,4` ADT Device Tree Nodes:**
-   - Updated `tools/mkadt.py` with authentic root syscfg identifiers (`serial-number`, `model-number`, `regulatory-model-number`, `mlb-serial-number`), `/chosen` (`board-id = 2`, `chip-id = 0x8960`), `/arm-io` (`H6`), and authentic `product` tree (37 properties).
-   - Regenerated `gtel.adt` (9,628 bytes), committed (`45b60dd`) and pushed to `main`.
+## What changed since the 2026-11-09 handoff
 
-2. **MobileGestalt Cache Generator:**
-   - Reverse-engineered `libMobileGestalt.dylib` fast hash table (stride `0xa0`, base `0x3c9e8`) and verified 120 precacheable keys (`flags & 0x10`).
-   - Created `tools/gen_gestalt_cache.py` generating authentic `com.apple.MobileGestalt.plist` with `CacheVersion = "16H81"`, `CacheUUID = "34156B22-E548-4F28-827E-7FDBA7A2CF33"`, and committed (`1e530e0`).
+Committed as `8ad5d67`, CI build `c3c108e` (2026-11-11).
 
-3. **Kernel Early Injection Patch (0103):**
-   - Created `xnu/patches/0103-gtel-inject-gestalt-cache.patch` (`769b6ec` / CI build `1e90b62`) embedding the 7,905-byte plist directly in the kernel image.
-   - During early boot (`bsdinit_task` before launchd exec), it checks and writes the plist with permissions `0644`.
-   - **Boot Test Confirmed (console_boot.txt):**
-     ```text
-     SWEET: Injecting authentic iPad4,4 MobileGestalt cache to /private/var/mobile/Library/Caches/com.apple.MobileGestalt.plist (7905 bytes)...
-     SWEET: MobileGestalt cache injected successfully!
-     Early boot complete. Continuing system boot.
-     ```
+1. **`0104-gtel-kernel-mkdir.patch`** — exports `sweet_kernel_mkdir(const char *path, int mode)`,
+   which builds a `vnode_attr` and calls `mkdir1at(vfs_context_kernel(), ..., UIO_SYSSPACE)`, so the
+   kernel can create directories with a kernel-space path.
 
-4. **THE CRITICAL REVERSE-ENGINEERING BREAKTHROUGH (Why Daemons Still Crashed):**
-   - We disassembled `libMobileGestalt.dylib` at the exact crash sites (`lr 0x18143c540`, `lr 0x18143c664`, `lr 0x18143a4a0`):
-     - Every crash happens because `MGCopyAnswer` fast-path misses in `0x39000`, falling back to `0x6510` which invokes an uninitialized dynamic resolver (`blr x8`).
-     - Why did fast-path miss? The initialization block at `0x4520` calls `0x3d24` with `w0 = 1`.
-     - **Function `0x3d24` HARDCODES the path to open:**
-       `0x3d6c: adrp x0, #0x28000; add x0, x0, #0xee3`
-       `--> /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist`!
-     - `0x3d24` **ONLY** reads from that systemgroup container path! It does **NOT** read from `/var/mobile/Library/Caches/`! (Only `__MGCacheValid` checks the fallback for validity, but the actual loader requires the container path!).
-     - When `open()` fails on that path, `0x3d24` aborts (`cbz x0, #0x4394`), leaving the in-memory cache table at `0x39000` completely unpopulated!
+2. **`0103-gtel-inject-gestalt-cache.patch`** — `sweet_inject_gestalt_cache()` now:
+   - `mkdir`s every component of
+     `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches`
+     with mode `0755` (logging `SWEET: mkdir <path> failed (errno N)` on failure),
+   - always rewrites `com.apple.MobileGestalt.plist` (mode `0644`) instead of skipping when the
+     legacy `/var/mobile/Library/Caches` copy exists.
+
+3. **`tools/gen_gestalt_cache.py`** — scalars (`bool` / `int32` / `int64` / `float32`) now go into
+   `CacheData` as raw values with their present flags instead of into `CacheExtra` (which is stored
+   as retained CF pointers, so scalars there read back as pointer bits). Keys are validated against
+   the dylib's question table (one non-precacheable key invalidates the whole cache), and
+   `WLANBkgScanCache` is an `int`, not a `bool`.
+
+4. **New plist**: `com.apple.MobileGestalt.plist` is now **4,844 bytes** (was 7,905) — binary bplist,
+   `CacheVersion = "16H81"`, `CacheUUID = 34156B22-E548-4F28-827E-7FDBA7A2CF33`,
+   `CacheData` = 3,780 bytes (`0xec4`) with 184 non-zero bytes, `CacheExtra` = 16 keys.
 
 ---
 
-## Action Plan for Next Session
-To make `0x3d24` load the cache into `0x39000` and stop all crashes:
+## Boot verdict, 2026-11-12 — the kernel side works, the cache was never the blocker
 
-1. **Option A (Simplest & Cleanest - Kernel Injection update):**
-   - In `sweet_inject_gestalt_cache()` (patch 0103), create the directory tree or a symlink:
-     - Check if `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist` can be opened.
-     - If intermediate directories are missing, create `/private/var/containers` as a symlink pointing to `/private/var/mobile`!
-       - If `/private/var/containers` -> `/private/var/mobile`, then:
-         `/private/var/containers/Library/Caches/com.apple.MobileGestalt.plist` resolves straight to `/private/var/mobile/Library/Caches/...`!
-   - **Option B (Direct container path injection):**
-     - Have the kernel create the intermediate directories using `vn_create` or boot ramdisk (`rd=md0`) with `gtel_shell` to run `mkdir -p` once on the eMMC filesystem and copy the plist.
-   - **Option C (Shared cache binary patch):**
-     - Patch `libMobileGestalt.dylib` at offset `0x3d70` so `add x0, x0, #0xee3` becomes `add x0, x0, #0xd44` (`/var/mobile/Library/Caches/com.apple.MobileGestalt.plist`). Then `0x3d24` reads directly from the file we already inject!
+Booted `shim-boot.img` (kernel `sha256 a203820f…`, identical to the CI artifact) on lk2nd and pulled
+the ring: **289,319 bytes** logged (`console_log_fix_head.txt` = first 64 KB,
+`console_log_fix.txt` = newest 256 KB).
 
-2. **Test & Verify:**
-   - Pack and boot with `RD=ufsroot0 EXTRA="sweetsample=launchd ufsrw=1 rootrw=1 nointr_consio=1"`.
-   - Verify that `SpringBoard`, `locationd`, `wifid`, and `atc` successfully read MobileGestalt from `0x39000` with 0 crash loops!
+**Kernel injection now lands exactly where `libMobileGestalt` looks:**
+
+```text
+SWEET: Writing iPad4,4 MobileGestalt cache to /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist (4844 bytes)...
+SWEET: MobileGestalt cache written successfully!
+```
+
+**But daemons still crash**, so we disassembled the crash sites instead of guessing:
+
+- `libMobileGestalt.dylib` is mapped at **`0x181420000`** in the shared region (this makes every
+  crash address line up inside `__text`, `0xe7c`–`0x24af0`).
+- `lr 0x18143c664` = offset **`0x1c664`**, which is exactly the instruction after
+  `bl 0x252e8` inside MobileGestalt's **container-path lookup**
+  (`…/MobileGestalt-645.270.1/MobileGestalt.c`, line 5811, the site that logs
+  `Failed to look up system group container path: %llu`).
+- `0x252e8` is a `__stubs` trampoline: `adrp x16, #0x3c000; ldr x16, [x16, #0x618]; br x16`.
+  Slot `0x3c618` is in `__la_symbol_ptr` and binds the import **`_rindex`**.
+- That slot holds garbage, so the `br x16` jumps into unmapped memory —
+  `pc = far = 0xf7870000` for keybagd, locationd, SpringBoard, and the rest.
+
+**Conclusion:** MobileGestalt dies in its container-path lookup *before it ever opens the plist*, so
+no cache file can fix these crashes. Every daemon that touches MobileGestalt dies the same way.
+Crash counts in the new window: `0x18143c540` ×28, `0x18143c664` ×62, `0x18143a4a0` ×0
+(Nov 9: 2 / 3 / 11) — the old `atc`/`backboardd` site is gone, and the system now runs much longer
+(495 `exec`s vs 165).
+
+### Loader requirements recovered (for whoever revisits the cache)
+
+- Path literal: `__cstring` `0x28ee3` (`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist`).
+- CFString keys in `__cfstring`: `CacheVersion` `0x7fd10`, `CacheData` `0x7fd30`,
+  `CacheExtra` `0x7fd50`, `CacheUUID` `0x7fd70`; expected UUID literal `0x7fd90` =
+  `34156B22-…`.
+- `CacheData` must be exactly `0xec4` (3,780) bytes; `CacheExtra` questions must be precacheable
+  (`verify_generated_cache.py` passes).
+- Our plist satisfies all of these statically, so **Option C from the Nov 9 handoff (patch
+  `0x3d70` `add #0xee3` → `#0xd44`) is obsolete** — the path is already correct.
+
+---
+
+## Action plan for next session
+
+1. **Fix lazy binding for `_rindex` (the actual blocker).** One change per boot:
+   - Check what `__la_symbol_ptr[0x3c618]` actually contains at fault time; if it holds a stub-helper
+     address, the `__stub_helper` → `dyld_stub_binder` path is what breaks.
+   - Cheapest experiment: force bind-at-load (dyld's bind-at-launch behaviour) so no lazy stub is
+     ever entered, or pre-bind the slot / patch the `br x16` to the real `rindex`.
+2. **Then re-evaluate MobileGestalt.** With MG init surviving, the cache we now seed correctly can be
+   measured for the first time (count real MG crashes, not stub crashes).
+3. **Graphics is progressing:** `backboardd` now reaches `sel 72/73/74`, `notifications type 3 on`,
+   then `SIGABRT` (sig 6) at `0x180adb094`, `far 0x1b7dda008` — a new failure mode past the Nov 9
+   baseline, worth a look after MG init survives.
+
+### Tooling notes
+- `tools/pull_log.py` reads 8 bytes per USB round trip (~340–460 B/s): a 256 KB pull takes ~10 min,
+  so run it in the background and poll its log.
+- If lk2nd goes silent (`USBTimeoutError` on the *first* `readq`, `getvar` also timing out), a
+  libusb `dev.reset()` unblocks it without touching the tablet — the DRAM ring survives:
+  `python -c "import usb.core, libusb_package; usb.core.find(idVendor=0x18d1,idProduct=0xd00d,backend=libusb_package.get_libusb1_backend()).reset()"`
 
 ---
 
