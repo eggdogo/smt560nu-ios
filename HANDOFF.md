@@ -96,13 +96,37 @@ Crash counts in the new window: `0x18143c540` ×28, `0x18143c664` ×62, `0x18143
 
 ---
 
+## 0105 experiment, 2026-11-13 — lazy binds now happen at launch, crash loops are gone
+
+`0105-gtel-launchd-bind-at-launch.patch` (commit `a464aca`, kernel `52bf490`, `sha256 7c853352…`):
+`load_init_program_at_path()` now copies `DYLD_BIND_AT_LAUNCH=1` into the scratch page, writes a
+one-entry `envp` array next to `argv`, and sets `init_exec_args.envp`. Until now that field was
+`USER_ADDR_NULL`, so **launchd had no environment at all** and no `DYLD_*` tuning was possible.
+
+Result (`console_log_0105.txt`, the whole 33,633-byte ring, ~16 sampler ticks):
+
+| | 0103/0104 run | 0105 run |
+| :--- | :--- | :--- |
+| crash blocks | **142** | **1** |
+| `Too many corpses` | 0 | 0 |
+| exception-delivery failures | many | 0 |
+| `bogus kernel message` | many | 0 |
+| daemon respawns | constant | none — atc, ptpd, imagent, backboardd, locationd, configd each start once; keybagd ×2 |
+
+`SWEET: MobileGestalt cache written successfully!` is still there, so 0103/0104 keep working — they
+were just never the blocker. The lazy-stub jump was.
+
+**One hold-out:** `SpringBoard[43]` still dies at `pc/far 0xf7870000`, `lr 0x18143c664` — the same
+`_rindex` stub jump, once, then it respawns and stays up. Every other daemon inherits the variable;
+SpringBoard is the job most likely to declare its own `EnvironmentVariables`, which replaces the
+inherited environment.
+
 ## Action plan for next session
 
-1. **Fix lazy binding for `_rindex` (the actual blocker).** One change per boot:
-   - Check what `__la_symbol_ptr[0x3c618]` actually contains at fault time; if it holds a stub-helper
-     address, the `__stub_helper` → `dyld_stub_binder` path is what breaks.
-   - Cheapest experiment: force bind-at-load (dyld's bind-at-launch behaviour) so no lazy stub is
-     ever entered, or pre-bind the slot / patch the `br x16` to the real `rindex`.
+1. **Get `DYLD_BIND_AT_LAUNCH` into SpringBoard too.** Its launchd job almost certainly defines
+   `EnvironmentVariables`, which drops ours. Add the key to
+   `/System/Library/LaunchDaemons/com.apple.SpringBoard.plist` (staged through the rootfs tooling),
+   then re-run and confirm 0 crash blocks.
 2. **Then re-evaluate MobileGestalt.** With MG init surviving, the cache we now seed correctly can be
    measured for the first time (count real MG crashes, not stub crashes).
 3. **Graphics is progressing:** `backboardd` now reaches `sel 72/73/74`, `notifications type 3 on`,
