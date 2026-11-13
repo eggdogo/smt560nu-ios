@@ -150,6 +150,16 @@ strings are present in the packed image, so the code really is in there).
   + signature check and then only logs `SWEET: dyld probe ok, bind-at-load byte is %d ...`,
   never writing. If 0107 survives and 0106 does not, the write is fine and the death is dyld
   itself - i.e. the flag took effect. Image: `shim-boot-0107.img` (39,686,144 B, `b4c6f51`).
+- **0107 (probe, writes nothing) also dies** - the device never came back over ~4 minutes of
+  polling. That kills the "our open path faults" theory and leaves one story that fits
+  everything: **0106's write landed on the eMMC**, so `/usr/lib/dyld` is still patched and
+  launchd/`init died` panics the box on *every* boot, whatever kernel you boot.
+- Which also means the flag **did** take effect: with bind-at-load on, dyld resolves the bad
+  `_rindex` slot eagerly at startup and dies there. So the defect is symbol resolution, not
+  laziness - `bindAtLoad=1` only moves the crash earlier.
+- `0108-gtel-dyld-revert.patch` is the recovery: it reads 0x5ba41 and, if it is non-zero,
+  writes 0 back **before launchd starts** (logs `reverted to 0` / `already 0`). Image
+  `shim-boot-0108.img` (39,686,144 B, `3197204`, built + packed, waiting for lk2nd).
 - Boot attempt 2026-11-13: `fastboot boot` reported OK, then the tablet stopped
   enumerating on USB within ~3 minutes (no `18d1:d00d`, no `04e8`/`05c6`, no orphan
   python) so **no ring could be pulled**. Unknown cause: panic + reset, a dead USB link,
