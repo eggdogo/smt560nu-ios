@@ -1,4 +1,4 @@
-# Handoff: iOS 12.5.7 on Galaxy Tab E (SM-T560NU), 2026-11-12
+# Handoff: iOS 12.5.7 on Galaxy Tab E (SM-T560NU), 2026-11-13
 
 ## How to talk to egg (the user)
 Please follow egg's style rules in every reply:
@@ -168,16 +168,72 @@ strings are present in the packed image, so the code really is in there).
 - Lesson: pull the ring **early** (first 32 KB after ~45 s) so the `SWEET: dyld ...` line
   is captured even if the device drops out later; the ring only exists while the kernel
   runs.
+- **0108 boot attempt:** `fastboot boot shim-boot-0108.img` reported OK, then the tablet stopped
+  enumerating within seconds and never came back over ~250 s of 5 s polling (no `18d1:d00d`, no
+  `04e8`/`05c6`, no unknown device in Windows PnP, no orphan python). So **0108 is lethal too** —
+  but note 0108 still does the `FREAD|FWRITE` open, so it does not discriminate anything yet.
+
+## 0109 experiment — take the write out of the open (pushed, CI build was still running)
+
+`0109-gtel-dyld-readonly.patch` (commit `a610632`) is the cleanest remaining probe: same file,
+same offsets, same signature check, but
+`vnode_open(SWEET_DYLD_PATH, FREAD, ...)` — **no write permission in the open, no `vn_rdwr`, no
+`fsync`**, closed with `FREAD`. It only logs:
+
+```text
+SWEET: dyld read-only ok, bind-at-load byte is 0
+```
+
+Why it matters: 0107 read the file but opened it `FREAD|FWRITE`, and it died exactly like 0106. So
+either (a) the byte 0106 wrote is still on the eMMC and every boot panics in `init died`, or (b) the
+**write-capable open itself** is the killer (a MAC / code-signing check that only runs for a write
+open of a platform binary, or a vnode-busy panic) and dyld was never modified at all.
+
+0109 separates (a) from (b) only if the eMMC is clean — which is what the 0105 reference boot is for
+(see below). CI run `43355654504` (`a610632`) was `in_progress` when this handoff was written; nothing
+was fetched or packed yet, so `shim-boot-0109.img` does not exist on disk.
+
+## Where things stand tonight (2026-11-13) — paused, tablet is off USB
+
+**The tablet is not enumerating** (needs egg to hold the keys and reset it into lk2nd). Nothing is
+half-flashed: everything went out with `fastboot boot`, and the only persistent writes are the ones
+the kernel itself makes to the rootfs (`ufsrw=1 rootrw=1`). Clean stop point.
+
+| image | patch | what it does | verdict |
+| :--- | :--- | :--- | :--- |
+| `shim-boot.img` | 0105 | `DYLD_BIND_AT_LAUNCH=1` in launchd's env only | **survives for minutes** — the known-good reference |
+| `shim-boot-0106.img` | 0106 | open `FREAD+FWRITE`, flip 0x5ba41 → 1 | dies, 3/3 boots |
+| `shim-boot-0107.img` | 0107 | same open, read + sig check, **no write** | dies, never back over ~4 min |
+| `shim-boot-0108.img` | 0108 | same open, write 0 back to 0x5ba41 | packed (`3197204`), died on first boot |
+| *(no image yet)* | 0109 | open **`FREAD` only**, read the byte, no write | CI `43355654504` still building |
 
 ## Action plan for next session
 
-1. **Boot 0106 and read the first 32 KB within a minute.** The patch is written; what is missing
-   is the verdict. Look for `SWEET: dyld bind-at-load enabled in /usr/lib/dyld` and then for crash
-   blocks — the expectation is that lazy `__la_symbol_ptr` stubs stop being entered at all.
-2. Only if dyld turns out not to be patchable this way, fall back to rewriting
-   `/System/Library/LaunchDaemons/*.plist` `EnvironmentVariables` for every job (rootfs work).
-3. **Then re-evaluate MobileGestalt**, and after that go for Step 4 (SpringBoard on screen).
-4. **Graphics note:** `backboardd` reaches `sel 72/73/74` + `notifications type 3 on`, then
+1. **Boot the known-good reference first: `python tools/pyfastboot.py boot shim-boot.img`** (0105,
+the build that stays up for minutes), then poll `python tools/pyfastboot.py devices` every 4–5 s for
+~250 s. This one boot settles the most important question — **is the on-disk dyld dirty?**
+   - **It survives** → the eMMC dyld is clean, 0106's write never landed, and the killer is the
+     write-capable open. Go to step 2.
+   - **It also dies** → byte 0x5ba41 really is 1 on the eMMC and every boot panics in `init died`.
+     Then recover at block level: `tools/hfs_locate.py` currently fails on this rootfs
+     (`python tools/hfs_locate.py ipsw/gtelroot.img.zst /usr/lib/dyld` → `C: not found under CNID 2`),
+     so use `tools/flash_block.py` with a block number found another way, or mount
+     `ipsw/gtelroot.img.zst` on Linux and zero byte `0x5ba41` of `/usr/lib/dyld`
+     (dyld-650.3.4, 567,184 B, `__text` 0x1000..0x46294).
+2. **Fetch and pack 0109** (only if CI `43355654504` is green):
+   `python tools/fetch_build.py --sha a610632`, then
+   `RD=ufsroot0 EXTRA="sweetsample=launchd ufsrw=1 rootrw=1 nointr_consio=1" bash tools/local_pack.sh xnu_build/kernel.development.sweet shim-boot-0109.img`
+   and boot it. Survives → the write open is the killer, and the next patch should read the byte
+   through a read-only open (or skip the file and fix the value in memory once dyld is mapped).
+3. **Pull the ring early** — `python tools/pull_log.py --head 8192 -o console_log_0109_head.txt`
+   about 45 s after `fastboot boot` — because the `SWEET: dyld ...` line *is* the experiment and a
+   bad patch drops the device off USB within ~3 minutes.
+4. Only if dyld cannot be touched from the kernel this way, fall back to rootfs work: rewrite
+   `/System/Library/LaunchDaemons/*.plist` `EnvironmentVariables` for every job.
+5. **Then re-evaluate MobileGestalt** (the real defect: the `_rindex` `__la_symbol_ptr` slot at
+   `0x3c618` holds garbage, so `br x16` jumps to `0x0f7870000`), and after that Step 4, SpringBoard
+   on screen.
+6. **Graphics note:** `backboardd` reaches `sel 72/73/74` + `notifications type 3 on`, then
    `SIGABRT` (sig 6) at `0x180adb094`, `far 0x1b7dda008` — already past the Nov 9 baseline.
 
 ### Tooling notes
