@@ -142,6 +142,14 @@ strings are present in the packed image, so the code really is in there).
   (or `already enabled` / `patch failed`).
 - 0106 is a **delta on top of 0103** (its context includes the gestalt block), so it only
   applies after 0103 — verified by applying 0103 then 0106 to a pristine `bsd_init.c`.
+- **0106 is lethal**: three boots, every time the tablet goes off USB within seconds and
+  never comes back (no `18d1:d00d`, no `04e8`/`05c6`, no unknown device). 0105 stayed alive
+  for minutes on the same flow. Either `sweet_patch_dyld_bind_at_load()` faults, or the byte
+  patch works and dyld dies immediately at launchd start (`init died` -> panic -> reset).
+- `0107-gtel-dyld-probe.patch` separates those two cases: it does the identical open + reads
+  + signature check and then only logs `SWEET: dyld probe ok, bind-at-load byte is %d ...`,
+  never writing. If 0107 survives and 0106 does not, the write is fine and the death is dyld
+  itself - i.e. the flag took effect. Image: `shim-boot-0107.img` (39,686,144 B, `b4c6f51`).
 - Boot attempt 2026-11-13: `fastboot boot` reported OK, then the tablet stopped
   enumerating on USB within ~3 minutes (no `18d1:d00d`, no `04e8`/`05c6`, no orphan
   python) so **no ring could be pulled**. Unknown cause: panic + reset, a dead USB link,
