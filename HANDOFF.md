@@ -96,42 +96,46 @@ Crash counts in the new window: `0x18143c540` ×28, `0x18143c664` ×62, `0x18143
 
 ---
 
-## 0105 experiment, 2026-11-13 — lazy binds now happen at launch, crash loops are gone
+## 0105 experiment, 2026-11-13 — the env route does **not** reach the daemons
 
 `0105-gtel-launchd-bind-at-launch.patch` (commit `a464aca`, kernel `52bf490`, `sha256 7c853352…`):
 `load_init_program_at_path()` now copies `DYLD_BIND_AT_LAUNCH=1` into the scratch page, writes a
 one-entry `envp` array next to `argv`, and sets `init_exec_args.envp`. Until now that field was
-`USER_ADDR_NULL`, so **launchd had no environment at all** and no `DYLD_*` tuning was possible.
+`USER_ADDR_NULL`, so **launchd had no environment at all**.
 
-Result (`console_log_0105.txt`, the whole 33,633-byte ring, ~16 sampler ticks):
+**First run looked like a win, and it was wrong.** That boot only logged 33,633 bytes (~16 sampler
+ticks) and stopped before the crashy phase: 1 crash block. The follow-up soak (96,497 bytes) shows
+the loops are all still there:
 
-| | 0103/0104 run | 0105 run |
-| :--- | :--- | :--- |
-| crash blocks | **142** | **1** |
-| `Too many corpses` | 0 | 0 |
-| exception-delivery failures | many | 0 |
-| `bogus kernel message` | many | 0 |
-| daemon respawns | constant | none — atc, ptpd, imagent, backboardd, locationd, configd each start once; keybagd ×2 |
+| | 0103/0104 run | 0105 short run | 0105 soak run |
+| :--- | :--- | :--- | :--- |
+| log size | 289,319 B | 33,633 B | 96,497 B |
+| execs | 495 | 98 | 181 (head window) |
+| crash blocks | 142 | 1 | **15 in 64 KB, 49 CRASH lines in the last 8 KB** |
+| respawns | constant | none seen yet | ptpd ×6, configd ×6, atc ×6, locationd ×4 |
 
-`SWEET: MobileGestalt cache written successfully!` is still there, so 0103/0104 keep working — they
-were just never the blocker. The lazy-stub jump was.
+So the env var is set for launchd, but it is **not taking effect in the daemons** — either launchd
+builds each job's environment from its plist instead of inheriting, or dyld prunes `DYLD_*` for
+platform binaries. Either way, `DYLD_BIND_AT_LAUNCH` is not a usable lever from the kernel side.
+Lesson worth keeping: a 33 KB ring is only the pre-crash phase — always compare windows of similar
+length.
 
-**One hold-out:** `SpringBoard[43]` still dies at `pc/far 0xf7870000`, `lr 0x18143c664` — the same
-`_rindex` stub jump, once, then it respawns and stays up. Every other daemon inherits the variable;
-SpringBoard is the job most likely to declare its own `EnvironmentVariables`, which replaces the
-inherited environment.
+`SWEET: MobileGestalt cache written successfully!` still appears, so 0103/0104 keep working; they
+were never the blocker either. The lazy/importer jump is.
 
 ## Action plan for next session
 
-1. **Get `DYLD_BIND_AT_LAUNCH` into SpringBoard too.** Its launchd job almost certainly defines
-   `EnvironmentVariables`, which drops ours. Add the key to
-   `/System/Library/LaunchDaemons/com.apple.SpringBoard.plist` (staged through the rootfs tooling),
-   then re-run and confirm 0 crash blocks.
-2. **Then re-evaluate MobileGestalt.** With MG init surviving, the cache we now seed correctly can be
-   measured for the first time (count real MG crashes, not stub crashes).
-3. **Graphics is progressing:** `backboardd` now reaches `sel 72/73/74`, `notifications type 3 on`,
-   then `SIGABRT` (sig 6) at `0x180adb094`, `far 0x1b7dda008` — a new failure mode past the Nov 9
-   baseline, worth a look after MG init survives.
+1. **Patch dyld itself (no env, no plist).** dyld reads `DYLD_BIND_AT_LAUNCH` from the environment;
+   force the bind-at-load path unconditionally instead. `/usr/lib/dyld` is a normal file on the
+   eMMC rootfs, and 0103 already proves the kernel can open + rewrite files at early boot
+   (`vn_open`/`vn_rdwr`), so a targeted in-place byte patch is preferable to embedding ~800 KB.
+   Start from `dyld_working` in this project, find the `getenv("DYLD_BIND_AT_LAUNCH")` site, and
+   pin the flag to 1.
+2. Only if dyld turns out not to be patchable this way, fall back to rewriting
+   `/System/Library/LaunchDaemons/*.plist` `EnvironmentVariables` for every job (rootfs work).
+3. **Then re-evaluate MobileGestalt**, and after that go for Step 4 (SpringBoard on screen).
+4. **Graphics note:** `backboardd` reaches `sel 72/73/74` + `notifications type 3 on`, then
+   `SIGABRT` (sig 6) at `0x180adb094`, `far 0x1b7dda008` — already past the Nov 9 baseline.
 
 ### Tooling notes
 - `tools/pull_log.py` reads 8 bytes per USB round trip (~340–460 B/s): a 256 KB pull takes ~10 min,
