@@ -1,0 +1,89 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6755,6 +6755,8 @@
+ 	int error;
+ 	struct execve_args init_exec_args;
+ 	user_addr_t argv0 = USER_ADDR_NULL, argv1 = USER_ADDR_NULL;
++	user_addr_t env0 = USER_ADDR_NULL;
++	user_addr_t envp_addr = USER_ADDR_NULL;
+ 
+ 	/*
+ 	 * Validate inputs and pre-conditions
+@@ -6792,8 +6794,31 @@
+ 		scratch_addr = USER_ADDR_ALIGN(scratch_addr + init_args_length, sizeof(user_addr_t));
+ 	}
+ 
++	/*
++	 * SWEET: hand init one environment variable so dyld resolves every
++	 * lazily-bound import at exec time instead of on first call. On this
++	 * platform the lazy stubs of libMobileGestalt branch through
++	 * __la_symbol_ptr slots that still hold their unbound image values, so
++	 * the first MobileGestalt container-path lookup lands on garbage
++	 * (pc/far 0xf7870000) and every daemon that touches MobileGestalt dies.
++	 * Binding at launch never enters a lazy stub.
++	 */
++	{
++		const char *init_env = "DYLD_BIND_AT_LAUNCH=1";
++		size_t init_env_length = strlen(init_env) + 1;
++
++		env0 = scratch_addr;
++		error = copyout(init_env, env0, init_env_length);
++		if (error) {
++			return error;
++		}
++
++		scratch_addr = USER_ADDR_ALIGN(scratch_addr + init_env_length, sizeof(user_addr_t));
++	}
++
+ 	if (proc_is64bit(p)) {
+ 		user64_addr_t argv64bit[3] = {};
++		user64_addr_t envp64bit[2] = {};
+ 
+ 		argv64bit[0] = argv0;
+ 		argv64bit[1] = argv1;
+@@ -6803,8 +6828,19 @@
+ 		if (error) {
+ 			return error;
+ 		}
++
++		scratch_addr = USER_ADDR_ALIGN(scratch_addr + sizeof(argv64bit), sizeof(user_addr_t));
++
++		envp64bit[0] = env0;
++		envp64bit[1] = USER_ADDR_NULL;
++		envp_addr = scratch_addr;
++		error = copyout(envp64bit, envp_addr, sizeof(envp64bit));
++		if (error) {
++			return error;
++		}
+ 	} else {
+ 		user32_addr_t argv32bit[3] = {};
++		user32_addr_t envp32bit[2] = {};
+ 
+ 		argv32bit[0] = (user32_addr_t)argv0;
+ 		argv32bit[1] = (user32_addr_t)argv1;
+@@ -6814,6 +6850,16 @@
+ 		if (error) {
+ 			return error;
+ 		}
++
++		scratch_addr = USER_ADDR_ALIGN(scratch_addr + sizeof(argv32bit), sizeof(user_addr_t));
++
++		envp32bit[0] = (user32_addr_t)env0;
++		envp32bit[1] = USER_ADDR_NULL;
++		envp_addr = scratch_addr;
++		error = copyout(envp32bit, envp_addr, sizeof(envp32bit));
++		if (error) {
++			return error;
++		}
+ 	}
+ 
+ 	/*
+@@ -6821,7 +6867,7 @@
+ 	 */
+ 	init_exec_args.fname = argv0;
+ 	init_exec_args.argp = scratch_addr;
+-	init_exec_args.envp = USER_ADDR_NULL;
++	init_exec_args.envp = envp_addr;
+ 
+ 	/*
+ 	 * So that init task is set with uid,gid 0 token
