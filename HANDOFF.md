@@ -123,14 +123,39 @@ length.
 `SWEET: MobileGestalt cache written successfully!` still appears, so 0103/0104 keep working; they
 were never the blocker either. The lazy/importer jump is.
 
+## 0106 experiment — patch dyld's bind-at-load flag in the file (booted, log lost)
+
+Image: `shim-boot-0106.img` (39,686,144 B) from CI `d4770cd`
+(`kernel.development.sweet` 17,106,976 B; the three `SWEET: dyld bind-at-load ...`
+strings are present in the packed image, so the code really is in there).
+
+- `dyld_working` is **dyld-650.3.4**, 567,184 B, arm64, `__text` 0x1000..0x46294.
+  `DYLD_BIND_AT_LAUNCH` sits at `__cstring` 0x46585; the env-name chain compares it at
+  `__text` 0x293c (`adrp/add/strcmp`) and its handler at 0x2c58 is just
+  `adrp x8,#0x5b000; add x8,x8,#0xa00; mov w9,#1; strb w9,[x8,#0x41]` — i.e. the switch
+  is a single byte of dyld's own `__DATA` at file offset **0x5ba41** (0 in the file).
+- `0106-gtel-dyld-bind-at-load.patch` adds `sweet_patch_dyld_bind_at_load()`, called
+  immediately after the MobileGestalt write under `ARM64_BOARD_CONFIG_SWEET`. It first
+  reads the 16 bytes at 0x2c58 and only proceeds if they match dyld-650.3.4 (otherwise it
+  logs `... is not the expected dyld build ... skipping` and leaves the file alone), then
+  flips 0x5ba41 0 -> 1, fsyncs, and logs `dyld bind-at-load enabled in /usr/lib/dyld`
+  (or `already enabled` / `patch failed`).
+- 0106 is a **delta on top of 0103** (its context includes the gestalt block), so it only
+  applies after 0103 — verified by applying 0103 then 0106 to a pristine `bsd_init.c`.
+- Boot attempt 2026-11-13: `fastboot boot` reported OK, then the tablet stopped
+  enumerating on USB within ~3 minutes (no `18d1:d00d`, no `04e8`/`05c6`, no orphan
+  python) so **no ring could be pulled**. Unknown cause: panic + reset, a dead USB link,
+  or the tablet powering down. Nothing is flashed, eMMC untouched except the one dyld
+  byte the kernel itself writes.
+- Lesson: pull the ring **early** (first 32 KB after ~45 s) so the `SWEET: dyld ...` line
+  is captured even if the device drops out later; the ring only exists while the kernel
+  runs.
+
 ## Action plan for next session
 
-1. **Patch dyld itself (no env, no plist).** dyld reads `DYLD_BIND_AT_LAUNCH` from the environment;
-   force the bind-at-load path unconditionally instead. `/usr/lib/dyld` is a normal file on the
-   eMMC rootfs, and 0103 already proves the kernel can open + rewrite files at early boot
-   (`vn_open`/`vn_rdwr`), so a targeted in-place byte patch is preferable to embedding ~800 KB.
-   Start from `dyld_working` in this project, find the `getenv("DYLD_BIND_AT_LAUNCH")` site, and
-   pin the flag to 1.
+1. **Boot 0106 and read the first 32 KB within a minute.** The patch is written; what is missing
+   is the verdict. Look for `SWEET: dyld bind-at-load enabled in /usr/lib/dyld` and then for crash
+   blocks — the expectation is that lazy `__la_symbol_ptr` stubs stop being entered at all.
 2. Only if dyld turns out not to be patchable this way, fall back to rewriting
    `/System/Library/LaunchDaemons/*.plist` `EnvironmentVariables` for every job (rootfs work).
 3. **Then re-evaluate MobileGestalt**, and after that go for Step 4 (SpringBoard on screen).
@@ -138,6 +163,8 @@ were never the blocker either. The lazy/importer jump is.
    `SIGABRT` (sig 6) at `0x180adb094`, `far 0x1b7dda008` — already past the Nov 9 baseline.
 
 ### Tooling notes
+
+- Windows Git Bash has no `strings`; use `grep -a -o "pattern" file` on binaries instead.
 - `tools/pull_log.py` reads 8 bytes per USB round trip (~340–460 B/s): a 256 KB pull takes ~10 min,
   so run it in the background and poll its log.
 - If lk2nd goes silent (`USBTimeoutError` on the *first* `readq`, `getvar` also timing out), a
