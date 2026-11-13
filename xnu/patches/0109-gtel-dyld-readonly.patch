@@ -1,0 +1,34 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1477,7 +1477,7 @@
+ 		mp->mnt_flag &= ~MNT_RDONLY;
+ 	}
+ 
+-	error = vnode_open(SWEET_DYLD_PATH, (FREAD | FWRITE), 0, 0, &vp, ctx);
++	error = vnode_open(SWEET_DYLD_PATH, FREAD, 0, 0, &vp, ctx);
+ 	if (error != 0) {
+ 		printf("SWEET: cannot open %s (errno %d)\n", SWEET_DYLD_PATH, error);
+ 		goto out;
+@@ -1508,19 +1508,9 @@
+ 		goto out;
+ 	}
+ 
+-	/* 0108: put the bind-at-load byte back to 0 so launchd gets a clean dyld. */
+-	if (cur != 0) {
+-		unsigned char zero = 0;
+-		resid = 0;
+-		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&zero, 1, SWEET_DYLD_FLAG_OFF,
+-		    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid,
+-		    vfs_context_proc(ctx));
+-		(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
+-		printf("SWEET: dyld bind-at-load reverted to 0 (err %d)\n", err);
+-	} else {
+-		printf("SWEET: dyld bind-at-load byte was already 0\n");
+-	}
+-	vnode_close(vp, FWRITE, ctx);
++	/* 0109: read-only open. No write, no fsync, close as FREAD. */
++	printf("SWEET: dyld read-only ok, bind-at-load byte is %d\n", cur);
++	vnode_close(vp, FREAD, ctx);
+ 
+ out:
+ 	if (mp && saved_flags) {
