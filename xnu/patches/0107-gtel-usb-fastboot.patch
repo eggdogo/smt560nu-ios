@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..c68e5ce
 --- /dev/null
 +++ b/bsd/dev/gtel_usb.c
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1209 @@
 +/*
 + * gtel MSM8916 ChipIdea HS-USB fastboot gadget + poweroff/reboot.
 + *
@@ -54,6 +54,7 @@ index 0000000..c68e5ce
 +extern volatile uint32_t *gtel_ps_hold_reg;
 +
 +void gtel_usb_start(void);
++void gtel_pmic_power_action(boolean_t reboot, boolean_t bootloader);
 +
 +/* MSM8916 GCC USB HS clock registers (0x01841000) */
 +#define GCC_USB_BASE_PA             0x01841000u
@@ -135,8 +136,28 @@ index 0000000..c68e5ce
 +#define CTRL_RXT_BULK               (2u << 2)
 +#define CTRL_RXS                    (1u << 0)
 +
-+/* Poweroff / Reset */
++/* Poweroff / Reset + PM8916 PON over SPMI V2 */
 +#define MPM2_MPM_PS_HOLD_PA         0x004AB000u
++#define PMIC_ARB_CORE_PA            0x0200F000u
++#define PMIC_ARB_CHNL_BASE_PA       0x02400000u
++#define PMIC_ARB_OBS_CHNL_BASE_PA   0x02C00000u
++#define PMIC_ARB_REG_CHLN_OFF(n)    (0x0800u + 4u * (uint32_t)(n))
++#define SPMI_PON_PPID               0x008u  /* slave_id 0, periph_id 0x08 */
++
++#define SPMI_CHNL_CMD0              0x00u
++#define SPMI_CHNL_CONFIG            0x04u
++#define SPMI_CHNL_STATUS            0x08u
++#define SPMI_CHNL_WDATA0            0x10u
++#define SPMI_CHNL_RDATA0            0x18u
++
++#define PON_PS_HOLD_RESET_CTL       0x5Au
++#define PON_PS_HOLD_RESET_CTL2      0x5Bu
++#define PON_SOFT_RB_SPARE           0x8Fu
++#define PON_PSHOLD_SHUTDOWN         0x04u
++#define PON_PSHOLD_HARD_RESET       0x07u
++#define PON_S2_RESET_EN             0x80u
++#define PON_FASTBOOT_MODE_COOKIE    0x08u   /* FASTBOOT_MODE (2) << 2 */
++
 +#define PSCI_SYSTEM_OFF             0x84000008ULL
 +#define PSCI_SYSTEM_RESET           0x84000009ULL
 +
@@ -234,8 +255,11 @@ index 0000000..c68e5ce
 +static struct {
 +	vm_offset_t     usb;
 +	vm_offset_t     gcc;
++	vm_offset_t     pon;
++	vm_offset_t     pon_obs;
 +	vm_offset_t     dma_va;
 +	uint32_t        dma_pa;
++	int32_t         pon_ch;
 +	struct gtel_qh  *qh;
 +	struct gtel_qtd *qtd;
 +	int             sleep_chan;
@@ -379,6 +403,81 @@ index 0000000..c68e5ce
 +	      "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
 +}
 +
++static int
++gtel_pon_read(uint8_t reg_off, uint8_t *out)
++{
++	if (gu.pon_obs == 0) {
++		return -1;
++	}
++	*(volatile uint32_t *)(gu.pon_obs + SPMI_CHNL_CONFIG) = 0u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(gu.pon_obs + SPMI_CHNL_CMD0) =
++	    (1u << 27) | ((uint32_t)reg_off << 4);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 2000u; i++) {
++		uint32_t st = *(volatile uint32_t *)(gu.pon_obs + SPMI_CHNL_STATUS);
++		__asm__ volatile ("dmb oshld" ::: "memory");
++		if (st != 0) {
++			if (st != 1u) {
++				return -1;
++			}
++			uint32_t rd = *(volatile uint32_t *)(gu.pon_obs + SPMI_CHNL_RDATA0);
++			__asm__ volatile ("dmb oshld" ::: "memory");
++			*out = (uint8_t)(rd & 0xffu);
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++gtel_pon_write(uint8_t reg_off, uint8_t val)
++{
++	if (gu.pon == 0) {
++		return -1;
++	}
++	*(volatile uint32_t *)(gu.pon + SPMI_CHNL_CONFIG) = 0u;
++	*(volatile uint32_t *)(gu.pon + SPMI_CHNL_WDATA0) = (uint32_t)val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(gu.pon + SPMI_CHNL_CMD0) = ((uint32_t)reg_off << 4);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 2000u; i++) {
++		uint32_t st = *(volatile uint32_t *)(gu.pon + SPMI_CHNL_STATUS);
++		__asm__ volatile ("dmb oshld" ::: "memory");
++		if (st != 0) {
++			return (st == 1u) ? 0 : -1;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++void
++gtel_pmic_power_action(boolean_t reboot, boolean_t bootloader)
++{
++	if (gu.pon != 0) {
++		uint8_t spare = 0;
++		(void)gtel_pon_read(PON_SOFT_RB_SPARE, &spare);
++		spare = (uint8_t)((spare & 0x03u) |
++		    ((reboot && bootloader) ? PON_FASTBOOT_MODE_COOKIE : 0u));
++		(void)gtel_pon_write(PON_SOFT_RB_SPARE, spare);
++		(void)gtel_pon_write(PON_PS_HOLD_RESET_CTL2, 0x00u);
++		delay(350);
++		(void)gtel_pon_write(PON_PS_HOLD_RESET_CTL,
++		    reboot ? PON_PSHOLD_HARD_RESET : PON_PSHOLD_SHUTDOWN);
++		(void)gtel_pon_write(PON_PS_HOLD_RESET_CTL2, PON_S2_RESET_EN);
++		delay(100);
++	}
++	FlushPoC_Dcache();
++	if (gtel_ps_hold_reg != NULL) {
++		*gtel_ps_hold_reg = 0u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(50000);
++	}
++	gtel_psci_call(reboot ? PSCI_SYSTEM_RESET : PSCI_SYSTEM_OFF);
++}
++
 +static void
 +gtel_usb_stop_hw(void)
 +{
@@ -398,25 +497,19 @@ index 0000000..c68e5ce
 +	gtel_usb_sleep_ms(50);
 +	gtel_usb_stop_hw();
 +	gtel_usb_sleep_ms(10);
-+	FlushPoC_Dcache();
-+	gtel_psci_call(PSCI_SYSTEM_OFF);
-+	if (gtel_ps_hold_reg != NULL) {
-+		*gtel_ps_hold_reg = 0;
-+		__asm__ volatile ("dsb sy" ::: "memory");
-+	}
++	gtel_pmic_power_action(FALSE, FALSE);
 +	for (;;) {
 +		__asm__ volatile ("wfe");
 +	}
 +}
 +
 +static __attribute__((noreturn)) void
-+gtel_do_reboot(void)
++gtel_do_reboot(bool bootloader)
 +{
 +	gtel_usb_sleep_ms(50);
 +	gtel_usb_stop_hw();
 +	gtel_usb_sleep_ms(10);
-+	FlushPoC_Dcache();
-+	gtel_psci_call(PSCI_SYSTEM_RESET);
++	gtel_pmic_power_action(TRUE, bootloader);
 +	for (;;) {
 +		__asm__ volatile ("wfe");
 +	}
@@ -864,54 +957,6 @@ index 0000000..c68e5ce
 +}
 +
 +static void
-+fastboot_oem_dmesg(void)
-+{
-+	uint64_t end = sweet_log_position();
-+	uint64_t pos = (end > GTEL_LOG_RING_SIZE) ? (end - GTEL_LOG_RING_SIZE) : 0;
-+	char raw[512];
-+	char pkt[65];
-+	size_t line_len = 0;
-+
-+	memcpy(pkt, "INFO", 4);
-+	while (pos < end) {
-+		uint64_t left = end - pos;
-+		uint32_t want = (uint32_t)(left > sizeof(raw) ? sizeof(raw) : left);
-+		uint32_t got = sweet_log_copy(&pos, raw, want);
-+		if (got == 0) {
-+			break;
-+		}
-+		for (uint32_t k = 0; k < got; k++) {
-+			char c = raw[k];
-+			if (c == '\r') {
-+				continue;
-+			}
-+			if (c == '\n') {
-+				if (line_len > 0) {
-+					if (ep1_tx_sync(pkt, (uint32_t)(4u + line_len)) != 0) {
-+						return;
-+					}
-+					line_len = 0;
-+				}
-+				continue;
-+			}
-+			pkt[4u + line_len++] = c;
-+			if (line_len == 60u) {
-+				if (ep1_tx_sync(pkt, 64u) != 0) {
-+					return;
-+				}
-+				line_len = 0;
-+			}
-+		}
-+	}
-+	if (line_len > 0) {
-+		if (ep1_tx_sync(pkt, (uint32_t)(4u + line_len)) != 0) {
-+			return;
-+		}
-+	}
-+	(void)ep1_tx_sync("OKAY", 4u);
-+}
-+
-+static void
 +fastboot_handle_cmd(const char *cmd)
 +{
 +	if (strcmp(cmd, "getvar:product") == 0) {
@@ -923,12 +968,8 @@ index 0000000..c68e5ce
 +		snprintf(resp, sizeof(resp), "OKAY%llu", (unsigned long long)sweet_log_position());
 +		(void)ep1_tx_sync(resp, (uint32_t)strlen(resp));
 +	} else if (strcmp(cmd, "getvar:all") == 0) {
-+		char resp[64];
 +		(void)ep1_tx_sync("INFOversion:0.5", 15u);
 +		(void)ep1_tx_sync("INFOproduct:gtel-xnu-ios", 24u);
-+		snprintf(resp, sizeof(resp), "INFOlog-size:%llu",
-+		    (unsigned long long)sweet_log_position());
-+		(void)ep1_tx_sync(resp, (uint32_t)strlen(resp));
 +		(void)ep1_tx_sync("OKAY", 4u);
 +	} else if (strncmp(cmd, "getvar:", 7) == 0) {
 +		(void)ep1_tx_sync("OKAY", 4u);
@@ -937,21 +978,19 @@ index 0000000..c68e5ce
 +	    strcmp(cmd, "oem shutdown") == 0) {
 +		(void)ep1_tx_sync("OKAY", 4u);
 +		gtel_do_poweroff();
++	} else if (strcmp(cmd, "reboot-bootloader") == 0 ||
++	    strcmp(cmd, "reboot bootloader") == 0) {
++		(void)ep1_tx_sync("OKAY", 4u);
++		gtel_do_reboot(true);
 +	} else if (strcmp(cmd, "reboot") == 0 ||
-+	    strcmp(cmd, "reboot-bootloader") == 0 ||
-+	    strcmp(cmd, "reboot bootloader") == 0 ||
 +	    strcmp(cmd, "oem reboot") == 0) {
 +		(void)ep1_tx_sync("OKAY", 4u);
-+		gtel_do_reboot();
-+	} else if (strcmp(cmd, "oem dmesg") == 0) {
-+		fastboot_oem_dmesg();
-+	} else if (strcmp(cmd, "upload") == 0) {
++		gtel_do_reboot(false);
++	} else if (strcmp(cmd, "oem dmesg") == 0 ||
++	    strcmp(cmd, "upload") == 0) {
 +		fastboot_upload();
 +	} else if (strcmp(cmd, "oem help") == 0) {
-+		(void)ep1_tx_sync("INFOgetvar:product|version|log-size|all", 39u);
-+		(void)ep1_tx_sync("INFOupload | oem dmesg", 22u);
-+		(void)ep1_tx_sync("INFOpoweroff | oem poweroff | oem shutdown", 42u);
-+		(void)ep1_tx_sync("INFOreboot | reboot-bootloader | oem reboot", 43u);
++		(void)ep1_tx_sync("INFOok", 6u);
 +		(void)ep1_tx_sync("OKAY", 4u);
 +	} else {
 +		(void)ep1_tx_sync("FAILunknown command", 19u);
@@ -1082,6 +1121,13 @@ index 0000000..c68e5ce
 +
 +	printf("gtel usb: ChipIdea HS-USB ready (ID=0x%08x, DMA=0x%08x)\n",
 +	    usb_rd(USB_ID), gu.dma_pa);
++	if (gu.pon != 0) {
++		uint8_t spare = 0xffu, ctl2 = 0xffu;
++		(void)gtel_pon_read(PON_SOFT_RB_SPARE, &spare);
++		(void)gtel_pon_read(PON_PS_HOLD_RESET_CTL2, &ctl2);
++		printf("gtel usb: PM8916 PON SPMI ch=%d (spare=0x%02x ctl2=0x%02x)\n",
++		    gu.pon_ch, spare, ctl2);
++	}
 +
 +	for (;;) {
 +		uint32_t sts = usb_rd(USB_USBSTS);
@@ -1125,11 +1171,25 @@ index 0000000..c68e5ce
 +	}
 +	started = true;
 +
-+	/* Map MPM2_MPM_PS_HOLD early so halt_all_cpus(FALSE) never needs io_map */
++	/* Map MPM2_MPM_PS_HOLD + PM8916 PON SPMI channel early so halt_all_cpus never needs io_map */
 +	if (gtel_ps_hold_reg == NULL) {
 +		vm_offset_t psh = ml_io_map(MPM2_MPM_PS_HOLD_PA, 0x1000u);
 +		if (psh != 0) {
 +			gtel_ps_hold_reg = (volatile uint32_t *)psh;
++		}
++	}
++	gu.pon_ch = -1;
++	vm_offset_t arb = ml_io_map(PMIC_ARB_CORE_PA, 0x1000u);
++	if (arb != 0) {
++		for (uint32_t ch = 0; ch < 128u; ch++) {
++			uint32_t v = *(volatile uint32_t *)(arb + PMIC_ARB_REG_CHLN_OFF(ch));
++			__asm__ volatile ("dmb oshld" ::: "memory");
++			if (((v >> 8) & 0xfffu) == SPMI_PON_PPID) {
++				gu.pon = ml_io_map(PMIC_ARB_CHNL_BASE_PA + ch * 0x8000u, 0x1000u);
++				gu.pon_obs = ml_io_map(PMIC_ARB_OBS_CHNL_BASE_PA + ch * 0x8000u, 0x1000u);
++				gu.pon_ch = (int32_t)ch;
++				break;
++			}
 +		}
 +	}
 +
@@ -1141,23 +1201,19 @@ index 0000000..c68e5ce
 +	gu.gcc = ml_io_map(GCC_USB_BASE_PA, GCC_USB_SIZE);
 +	gu.usb = ml_io_map(MSM_USB_BASE_PA, MSM_USB_SIZE);
 +	if (gu.gcc == 0 || gu.usb == 0) {
-+		printf("gtel usb: MMIO map failed\n");
 +		return;
 +	}
 +
 +	if (kmem_alloc_contig(kernel_map, &gu.dma_va, GTEL_DMA_SIZE, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("gtel usb: contiguous DMA alloc failed\n");
 +		return;
 +	}
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gu.dma_va);
 +	if (pn == 0) {
-+		printf("gtel usb: pmap_find_phys failed\n");
 +		return;
 +	}
 +	uint64_t pa = ptoa_64(pn);
 +	if ((pa >> 32) != 0 || ((pa + GTEL_DMA_SIZE - 1u) >> 32) != 0) {
-+		printf("gtel usb: DMA PA 0x%llx exceeds 32 bits\n", (unsigned long long)pa);
 +		return;
 +	}
 +	gu.dma_pa = (uint32_t)pa;
@@ -1187,45 +1243,33 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index 3115a03..0cbcafe 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -742,6 +742,11 @@ ml_get_machine_mem(void)
+@@ -742,6 +742,12 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
 +#if defined(SWEET)
 +extern volatile uint32_t *gtel_ps_hold_reg;
 +volatile uint32_t *gtel_ps_hold_reg = NULL;
++extern void gtel_pmic_power_action(boolean_t reboot, boolean_t bootloader);
 +#endif
 +
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
-@@ -751,13 +756,27 @@ halt_all_cpus(boolean_t reboot)
+@@ -751,13 +757,10 @@ halt_all_cpus(boolean_t reboot)
  	 * gtel: the console log (sweetlog ring) is read back from DRAM by
  	 * tools/pull_log.py after a reset, and a reset drops dirty cache
  	 * lines: clean the whole data cache first. Then reset through PSCI
 -	 * SYSTEM_RESET instead of spinning, so a panic lands back in lk2nd.
-+	 * SYSTEM_RESET or shut down through PSCI SYSTEM_OFF + PS_HOLD fallback.
++	 * or PM8916 PON + PS_HOLD (fastboot on panic, shutdown when !reboot).
  	 */
 -	printf(reboot ? "MACH Reboot (PSCI)\n" : "CPU halted\n");
-+	printf(reboot ? "MACH Reboot (PSCI)\n" : "CPU halted (PSCI OFF)\n");
++	printf(reboot ? "MACH Reboot (PMIC/PSCI)\n" : "CPU halted (PMIC/PSCI OFF)\n");
  	FlushPoC_Dcache();
- 	if (reboot) {
- 		register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
- 		__asm__ volatile ("smc #0" : "+r"(x0) : : "memory");
-+	} else {
-+		register uint64_t x0 __asm__("x0") = 0x84000008;        /* PSCI SYSTEM_OFF */
-+		register uint64_t x1 __asm__("x1") = 0;
-+		register uint64_t x2 __asm__("x2") = 0;
-+		register uint64_t x3 __asm__("x3") = 0;
-+		__asm__ volatile ("smc #0"
-+		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
-+		    :
-+		    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
-+		      "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
-+		if (gtel_ps_hold_reg != NULL) {
-+			*gtel_ps_hold_reg = 0;
-+			__asm__ volatile ("dsb sy" ::: "memory");
-+		}
- 	}
+-	if (reboot) {
+-		register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
+-		__asm__ volatile ("smc #0" : "+r"(x0) : : "memory");
+-	}
++	gtel_pmic_power_action(reboot, reboot);
  #endif
  	if (reboot) {
