@@ -1,90 +1,95 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 5aa16da..60b9224 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -1439,6 +1439,94 @@
+@@ -1445,6 +1445,97 @@ sweet_inject_gestalt_cache(void)
  		mp->mnt_flag = saved_flags;
  	}
  }
 +
 +/*
-+ * dyld-650.3.4 only turns on bind-at-load when it finds DYLD_BIND_AT_LAUNCH in
-+ * the environment, and launchd's environment never reaches the jobs it spawns.
-+ * That switch is a single byte of dyld's own __DATA: the handler at
-+ * __text+0x2c58 does `strb #1, [gLinkContext + 0x41]`, and the byte sits at
-+ * file offset 0x5ba41. Flip it in the file so every image binds its lazy
-+ * imports while loading, instead of entering a lazy __la_symbol_ptr stub whose
-+ * slot holds garbage - which is how libMobileGestalt and friends were dying
-+ * (bl -> __stubs -> _rindex slot -> pc = far = 0xf7870000).
++ * 0106 previously flipped byte 0x5ba41 of /usr/lib/dyld (dyld-650.3.4
++ * gLinkContext.bindAtLoad) from 0 to 1 on eMMC. Open /usr/lib/dyld
++ * read-only first to verify the signature and check byte 0x5ba41; only if
++ * cur != 0 do we open FREAD|FWRITE, write 0 back, fsync, and close FWRITE.
 + */
 +#define SWEET_DYLD_PATH     "/usr/lib/dyld"
 +#define SWEET_DYLD_SIG_OFF  0x2c58   /* adrp/add/mov/strb for the flag */
-+#define SWEET_DYLD_FLAG_OFF 0x5ba41  /* gLinkContext.bindAtLoad            */
++#define SWEET_DYLD_FLAG_OFF 0x5ba41  /* gLinkContext.bindAtLoad        */
 +
-+static unsigned char sweet_dyld_sig[16] = {
++static const unsigned char sweet_dyld_sig[16] = {
 +	0xc8, 0x02, 0x00, 0xb0, 0x08, 0x01, 0x28, 0x91,
 +	0xe9, 0x03, 0x00, 0x32, 0x09, 0x05, 0x01, 0x39,
 +};
 +
 +static void
-+sweet_patch_dyld_bind_at_load(void)
++sweet_revert_dyld_bind_at_load(void)
 +{
 +	vnode_t vp = NULLVP;
 +	vfs_context_t ctx = vfs_context_kernel();
 +	mount_t mp = rootvnode ? rootvnode->v_mount : NULL;
 +	uint64_t saved_flags = 0;
-+	unsigned char sig[sizeof(sweet_dyld_sig)];
++	unsigned char sig[sizeof(sweet_dyld_sig)] = { 0 };
 +	unsigned char cur = 0;
-+	unsigned char one = 1;
++	unsigned char zero = 0;
 +	int resid = 0;
 +	int error = 0;
 +	int err = 0;
 +
-+	if (mp && (mp->mnt_flag & MNT_RDONLY)) {
-+		saved_flags = mp->mnt_flag;
-+		mp->mnt_flag &= ~MNT_RDONLY;
-+	}
-+
-+	error = vnode_open(SWEET_DYLD_PATH, (FREAD | FWRITE), 0, 0, &vp, ctx);
++	error = vnode_open(SWEET_DYLD_PATH, FREAD, 0, 0, &vp, ctx);
 +	if (error != 0) {
 +		printf("SWEET: cannot open %s (errno %d)\n", SWEET_DYLD_PATH, error);
-+		goto out;
++		return;
 +	}
 +
 +	err = vn_rdwr(UIO_READ, vp, (caddr_t)sig, (int)sizeof(sig),
 +	    SWEET_DYLD_SIG_OFF, UIO_SYSSPACE, IO_NODELOCKED,
 +	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+	if (err != 0 || bcmp(sig, sweet_dyld_sig, sizeof(sig)) != 0) {
++	if (err != 0 || resid != 0 || bcmp(sig, sweet_dyld_sig, sizeof(sig)) != 0) {
 +		printf("SWEET: %s is not the expected dyld build (err %d, sig %02x%02x%02x%02x), skipping\n",
 +		    SWEET_DYLD_PATH, err, sig[0], sig[1], sig[2], sig[3]);
 +		vnode_close(vp, FREAD, ctx);
-+		goto out;
++		return;
 +	}
 +
 +	resid = 0;
 +	err = vn_rdwr(UIO_READ, vp, (caddr_t)&cur, 1, SWEET_DYLD_FLAG_OFF,
 +	    UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid,
 +	    vfs_context_proc(ctx));
-+	if (err != 0) {
++	vnode_close(vp, FREAD, ctx);
++	if (err != 0 || resid != 0) {
 +		printf("SWEET: cannot read dyld bind-at-load byte (errno %d)\n", err);
-+		vnode_close(vp, FREAD, ctx);
-+		goto out;
++		return;
 +	}
-+	if (cur == 1) {
-+		printf("SWEET: dyld bind-at-load already enabled\n");
-+		vnode_close(vp, FREAD, ctx);
++	if (cur == 0) {
++		printf("SWEET: dyld bind-at-load byte is already 0\n");
++		return;
++	}
++
++	printf("SWEET: dyld bind-at-load byte is %u, reverting to 0\n", cur);
++	if (mp && (mp->mnt_flag & MNT_RDONLY)) {
++		saved_flags = mp->mnt_flag;
++		mp->mnt_flag &= ~MNT_RDONLY;
++	}
++
++	vp = NULLVP;
++	error = vnode_open(SWEET_DYLD_PATH, (FREAD | FWRITE), 0, 0, &vp, ctx);
++	if (error != 0) {
++		printf("SWEET: cannot open %s for write (errno %d)\n", SWEET_DYLD_PATH, error);
 +		goto out;
 +	}
 +
 +	resid = 0;
-+	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&one, 1, SWEET_DYLD_FLAG_OFF,
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&zero, 1, SWEET_DYLD_FLAG_OFF,
 +	    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid,
 +	    vfs_context_proc(ctx));
 +	(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
 +	vnode_close(vp, FWRITE, ctx);
 +
-+	if (err == 0) {
-+		printf("SWEET: dyld bind-at-load enabled in %s\n", SWEET_DYLD_PATH);
++	if (err == 0 && resid == 0) {
++		printf("SWEET: dyld bind-at-load reverted to 0 in %s\n", SWEET_DYLD_PATH);
 +	} else {
-+		printf("SWEET: dyld bind-at-load patch failed (errno %d)\n", err);
++		printf("SWEET: dyld bind-at-load revert failed (errno %d)\n", err);
 +	}
 +
 +out:
@@ -95,11 +100,11 @@
  #endif
  
  void
-@@ -1469,6 +1557,7 @@
+@@ -1475,6 +1566,7 @@ bsdinit_task(void)
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  	sweet_inject_gestalt_cache();
-+	sweet_patch_dyld_bind_at_load();
++	sweet_revert_dyld_bind_at_load();
  #endif
  
  	load_init_program(p);

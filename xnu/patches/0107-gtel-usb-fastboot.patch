@@ -1,0 +1,1231 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9730cab..a9e75eb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/gtel_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/gtel_usb.c b/bsd/dev/gtel_usb.c
+new file mode 100644
+index 0000000..c68e5ce
+--- /dev/null
++++ b/bsd/dev/gtel_usb.c
+@@ -0,0 +1,1153 @@
++/*
++ * gtel MSM8916 ChipIdea HS-USB fastboot gadget + poweroff/reboot.
++ *
++ * SM-T560NU (Snapdragon 410 / MSM8916) uses the ChipIdea HS-USB OTG controller
++ * at 0x078d9000 with an external/integrated ULPI PHY and GCC USB HS clocks at
++ * 0x01841000. lk2nd stops USB (udc_stop()) before jumping to XNU, so we clock,
++ * reset, force VBUS session-valid via ULPI + GENCONFIG_2 + USBCMD, and run a
++ * polled fastboot device (VID 0x18d1, PID 0xd00d) over Bulk EP1 IN/OUT.
++ *
++ * All DMA structures (32x64B endpoint queue heads, 64B-padded QTDs, EP0/EP1
++ * buffers) live in a single kmem_alloc_contig() region whose PA fits in 32 bits.
++ * Non-coherent DMA: CleanPoC_DcacheRegion / FlushPoC_DcacheRegion are called
++ * around every descriptor and buffer access.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++extern volatile uint32_t *gtel_ps_hold_reg;
++
++void gtel_usb_start(void);
++
++/* MSM8916 GCC USB HS clock registers (0x01841000) */
++#define GCC_USB_BASE_PA             0x01841000u
++#define GCC_USB_SIZE                0x1000u
++#define GCC_USB_HS_BCR              0x00u
++#define GCC_USB_HS_SYSTEM_CBCR      0x04u
++#define GCC_USB_HS_AHB_CBCR         0x08u
++#define GCC_USB_HS_SYSTEM_CMD_RCGR  0x10u
++#define GCC_USB_HS_SYSTEM_CFG_RCGR  0x14u
++
++#define CBCR_CLK_ENABLE             (1u << 0)
++#define CBCR_CLK_OFF                (1u << 31)
++#define RCGR_CMD_UPDATE             (1u << 0)
++#define RCGR_CFG_80MHZ_GPLL0        ((1u << 8) | 19u)
++
++/* MSM8916 ChipIdea HS-USB controller (PERIPH_SS_BASE + 0x000D9000) */
++#define MSM_USB_BASE_PA             0x078d9000u
++#define MSM_USB_SIZE                0x1000u
++
++#define USB_ID                      0x0000u
++#define USB_SBUSCFG                 0x0090u
++#define USB_AHB_MODE                0x0098u
++#define USB_GENCONFIG_2             0x00A0u
++#define  GEN2_SESS_VLD_CTRL_EN      (1u << 7)
++
++#define USB_USBCMD                  0x0140u
++#define  USBCMD_ATTACH              (1u << 0)
++#define  USBCMD_RESET               (1u << 1)
++#define  USBCMD_SUTW                (1u << 13)
++#define  USBCMD_ITC_8               (0x08u << 16)
++#define  SESS_VLD_CTRL              (1u << 25)
++
++#define USB_USBSTS                  0x0144u
++#define  STS_UI                     (1u << 0)
++#define  STS_UEI                    (1u << 1)
++#define  STS_PCI                    (1u << 2)
++#define  STS_URI                    (1u << 6)
++#define  STS_SLI                    (1u << 8)
++
++#define USB_USBINTR                 0x0148u
++#define USB_DEVICEADDR              0x0154u
++#define USB_ENDPOINTLISTADDR        0x0158u
++#define USB_ULPI_VIEWPORT           0x0170u
++#define  ULPI_RUN                   (1u << 30)
++#define  ULPI_WRITE                 (1u << 29)
++#define  ULPI_READ                  0u
++#define  ULPI_ADDR(n)               (((uint32_t)(n) & 0xffu) << 16)
++#define  ULPI_DATA(n)               ((uint32_t)(n) & 0xffu)
++
++#define ULPI_MISC_A_SET             0x97u
++#define ULPI_MISC_A_CLEAR           0x98u
++#define ULPI_MISC_A_VBUSVLDEXTSEL   (1u << 1)
++#define ULPI_MISC_A_VBUSVLDEXT      (1u << 0)
++
++#define USB_PORTSC                  0x0184u
++#define  PORTSC_PTS_ULPI            0x80000000u
++#define  PORTSC_PSPD_SHIFT          26u
++#define  PORTSC_PSPD_HS             2u
++
++#define USB_USBMODE                 0x01A8u
++#define  USBMODE_DEVICE             2u
++
++#define USB_ENDPTSETUPSTAT          0x01ACu
++#define USB_ENDPTPRIME              0x01B0u
++#define USB_ENDPTFLUSH              0x01B4u
++#define USB_ENDPTSTAT               0x01B8u
++#define USB_ENDPTCOMPLETE           0x01BCu
++#define USB_ENDPTCTRL(n)            (0x01C0u + 4u * (uint32_t)(n))
++
++#define EPT_TX(n)                   (1u << ((uint32_t)(n) + 16u))
++#define EPT_RX(n)                   (1u << (uint32_t)(n))
++
++#define CTRL_TXE                    (1u << 23)
++#define CTRL_TXR                    (1u << 22)
++#define CTRL_TXT_BULK               (2u << 18)
++#define CTRL_TXS                    (1u << 16)
++#define CTRL_RXE                    (1u << 7)
++#define CTRL_RXR                    (1u << 6)
++#define CTRL_RXT_BULK               (2u << 2)
++#define CTRL_RXS                    (1u << 0)
++
++/* Poweroff / Reset */
++#define MPM2_MPM_PS_HOLD_PA         0x004AB000u
++#define PSCI_SYSTEM_OFF             0x84000008ULL
++#define PSCI_SYSTEM_RESET           0x84000009ULL
++
++/* Endpoint Queue Head (64 bytes, 1 cache line) */
++struct gtel_qh {
++	uint32_t config;
++	uint32_t current;
++	uint32_t next;
++	uint32_t info;
++	uint32_t page0;
++	uint32_t page1;
++	uint32_t page2;
++	uint32_t page3;
++	uint32_t page4;
++	uint32_t reserved0;
++	uint8_t  setup_data[8];
++	uint32_t reserved[4];
++};
++
++#define CONFIG_MAX_PKT(n)           (((uint32_t)(n)) << 16)
++#define CONFIG_ZLT                  (1u << 29)
++#define CONFIG_IOS                  (1u << 15)
++
++/* Endpoint Transfer Descriptor (32B HW + 32B pad = 64B cache line) */
++struct gtel_qtd {
++	uint32_t next;
++	uint32_t info;
++	uint32_t page0;
++	uint32_t page1;
++	uint32_t page2;
++	uint32_t page3;
++	uint32_t page4;
++	uint32_t reserved;
++	uint32_t pad[8];
++};
++
++#define TERMINATE                   1u
++#define INFO_BYTES(n)               (((uint32_t)(n)) << 16)
++#define INFO_IOC                    (1u << 15)
++#define INFO_ACTIVE                 (1u << 7)
++#define INFO_ERR_MASK               0xffu
++
++#define MAX_TD_XFER_SIZE            (16u * 1024u)
++#define MAX_TX_QTDS                 4u
++
++/* DMA region layout */
++#define DMA_QH_OFF                  0x0000u
++#define DMA_QTD_OFF                 0x1000u
++#define DMA_EP0_OFF                 0x2000u
++#define DMA_RX_OFF                  0x3000u
++#define DMA_TX_OFF                  0x4000u
++
++#define GTEL_EP0_BUF_SIZE           4096u
++#define GTEL_RX_BUF_SIZE            4096u
++#define GTEL_TX_BUF_SIZE            (MAX_TX_QTDS * MAX_TD_XFER_SIZE) /* 64 KiB */
++#define GTEL_DMA_SIZE               (DMA_TX_OFF + GTEL_TX_BUF_SIZE)  /* 80 KiB */
++
++#define QTD_EP0_OUT                 0u
++#define QTD_EP0_IN                  1u
++#define QTD_EP1_OUT                 2u
++#define QTD_EP1_IN_BASE             3u
++
++#define GTEL_LOG_RING_SIZE          (4u << 20)
++
++/* USB standard setup packet & requests */
++struct usb_setup_pkt {
++	uint8_t  type;
++	uint8_t  request;
++	uint16_t value;
++	uint16_t index;
++	uint16_t length;
++} __attribute__((packed));
++
++#define USB_REQ_GET_STATUS          0u
++#define USB_REQ_CLEAR_FEATURE       1u
++#define USB_REQ_SET_FEATURE         3u
++#define USB_REQ_SET_ADDRESS         5u
++#define USB_REQ_GET_DESCRIPTOR      6u
++#define USB_REQ_GET_CONFIGURATION   8u
++#define USB_REQ_SET_CONFIGURATION   9u
++#define USB_REQ_GET_INTERFACE       10u
++#define USB_REQ_SET_INTERFACE       11u
++
++#define USB_DESC_DEVICE             1u
++#define USB_DESC_CONFIGURATION      2u
++#define USB_DESC_STRING             3u
++
++enum ep0_phase {
++	EP0_IDLE = 0,
++	EP0_TX_DATA,
++	EP0_TX_ACK,
++	EP0_RX_STATUS,
++};
++
++static struct {
++	vm_offset_t     usb;
++	vm_offset_t     gcc;
++	vm_offset_t     dma_va;
++	uint32_t        dma_pa;
++	struct gtel_qh  *qh;
++	struct gtel_qtd *qtd;
++	int             sleep_chan;
++	enum ep0_phase  ep0_state;
++	uint32_t        session;
++	bool            highspeed;
++	bool            online;
++	uint8_t         config_val;
++	bool            rx_armed;
++} gu;
++
++static const uint8_t gtel_dev_desc[18] = {
++	18, 1,
++	0x00, 0x02,             /* bcdUSB 2.00 */
++	0x00, 0x00, 0x00,       /* class / subclass / protocol */
++	64,                     /* bMaxPacketSize0 */
++	0xd1, 0x18,             /* idVendor  0x18d1 (Google) */
++	0x0d, 0xd0,             /* idProduct 0xd00d (fastboot) */
++	0x00, 0x01,             /* bcdDevice 1.00 */
++	1, 2, 3,                /* iManufacturer, iProduct, iSerialNumber */
++	1,                      /* bNumConfigurations */
++};
++
++static const uint8_t gtel_cfg_desc_tmpl[32] = {
++	9, 2, 32, 0, 1, 1, 0, 0x80, 0x80,
++	9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 4,     /* Fastboot interface */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0x00,     /* Bulk IN  0x81 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0x01,     /* Bulk OUT 0x01 */
++};
++
++static const char *const gtel_usb_strings[] = {
++	NULL,
++	"Google",
++	"gtel-xnu-ios",
++	"gtel-ios",
++	"fastboot",
++};
++
++static inline uint32_t
++usb_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(gu.usb + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++usb_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gu.usb + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++gcc_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(gu.gcc + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++gcc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gu.gcc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* caches_asm.s loops forever on len == 0 when VA is cache-line aligned */
++static inline void
++gu_dcache_clean(vm_offset_t va, size_t len)
++{
++	if (len > 0) {
++		CleanPoC_DcacheRegion(va, len);
++	}
++}
++
++static inline void
++gu_dcache_flush(vm_offset_t va, size_t len)
++{
++	if (len > 0) {
++		FlushPoC_DcacheRegion(va, len);
++	}
++}
++
++static void
++gtel_usb_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gu.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++gtel_qtd_pa(uint32_t idx)
++{
++	return gu.dma_pa + DMA_QTD_OFF + idx * (uint32_t)sizeof(struct gtel_qtd);
++}
++
++static void
++gtel_qtd_set_pages(struct gtel_qtd *td, uint32_t pa)
++{
++	uint32_t pg = pa & ~0xfffu;
++	td->page0 = pa;
++	td->page1 = pg + 0x1000u;
++	td->page2 = pg + 0x2000u;
++	td->page3 = pg + 0x3000u;
++	td->page4 = pg + 0x4000u;
++}
++
++static void
++ulpi_write(uint32_t val, uint32_t reg)
++{
++	usb_wr(USB_ULPI_VIEWPORT, ULPI_RUN | ULPI_WRITE | ULPI_ADDR(reg) | ULPI_DATA(val));
++	for (int i = 0; i < 100000 && (usb_rd(USB_ULPI_VIEWPORT) & ULPI_RUN); i++) {
++		delay(1);
++	}
++}
++
++static void
++ep_flush(uint32_t bits)
++{
++	usb_wr(USB_ENDPTFLUSH, bits);
++	for (int i = 0; i < 100000 && (usb_rd(USB_ENDPTFLUSH) & bits); i++) {
++		delay(1);
++	}
++}
++
++static void
++gtel_psci_call(uint64_t fid)
++{
++	register uint64_t x0 __asm__("x0") = fid;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	      "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++static void
++gtel_usb_stop_hw(void)
++{
++	ep_flush(0xffffffffu);
++	usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) & ~USBCMD_ATTACH);
++	usb_wr(USB_USBINTR, 0u);
++	ulpi_write(ULPI_MISC_A_VBUSVLDEXTSEL | ULPI_MISC_A_VBUSVLDEXT, ULPI_MISC_A_CLEAR);
++	usb_wr(USB_USBCMD, USBCMD_RESET);
++	for (int i = 0; i < 100000 && (usb_rd(USB_USBCMD) & USBCMD_RESET); i++) {
++		delay(1);
++	}
++}
++
++static __attribute__((noreturn)) void
++gtel_do_poweroff(void)
++{
++	gtel_usb_sleep_ms(50);
++	gtel_usb_stop_hw();
++	gtel_usb_sleep_ms(10);
++	FlushPoC_Dcache();
++	gtel_psci_call(PSCI_SYSTEM_OFF);
++	if (gtel_ps_hold_reg != NULL) {
++		*gtel_ps_hold_reg = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++static __attribute__((noreturn)) void
++gtel_do_reboot(void)
++{
++	gtel_usb_sleep_ms(50);
++	gtel_usb_stop_hw();
++	gtel_usb_sleep_ms(10);
++	FlushPoC_Dcache();
++	gtel_psci_call(PSCI_SYSTEM_RESET);
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++/* ---- EP0 helpers ---- */
++
++static void
++ep0_prime(uint32_t qh_idx, uint32_t qtd_idx, uint32_t buf_pa, uint32_t len)
++{
++	struct gtel_qh *qh = &gu.qh[qh_idx];
++	struct gtel_qtd *td = &gu.qtd[qtd_idx];
++	uint32_t bit = (qh_idx & 1u) ? EPT_TX(0) : EPT_RX(0);
++
++	td->next = TERMINATE;
++	td->info = INFO_BYTES(len) | INFO_IOC | INFO_ACTIVE;
++	gtel_qtd_set_pages(td, buf_pa);
++	gu_dcache_flush((vm_offset_t)td, sizeof(*td));
++
++	qh->next = gtel_qtd_pa(qtd_idx);
++	qh->info = 0;
++	gu_dcache_flush((vm_offset_t)qh, sizeof(*qh));
++
++	usb_wr(USB_ENDPTPRIME, bit);
++}
++
++static void
++ep0_tx(const void *data, uint32_t len)
++{
++	if (len > GTEL_EP0_BUF_SIZE) {
++		len = GTEL_EP0_BUF_SIZE;
++	}
++	if (len > 0) {
++		memcpy((void *)(gu.dma_va + DMA_EP0_OFF), data, len);
++		gu_dcache_clean(gu.dma_va + DMA_EP0_OFF, len);
++	}
++	gu.ep0_state = EP0_TX_DATA;
++	ep0_prime(1u, QTD_EP0_IN, gu.dma_pa + DMA_EP0_OFF, len);
++}
++
++static void
++ep0_ack(void)
++{
++	gu.ep0_state = EP0_TX_ACK;
++	ep0_prime(1u, QTD_EP0_IN, gu.dma_pa + DMA_EP0_OFF, 0u);
++}
++
++static void
++ep0_stall(void)
++{
++	usb_wr(USB_ENDPTCTRL(0), usb_rd(USB_ENDPTCTRL(0)) | CTRL_TXS | CTRL_RXS);
++	gu.ep0_state = EP0_IDLE;
++}
++
++/* ---- EP1 Bulk helpers ---- */
++
++static void
++ep1_arm_rx(void)
++{
++	struct gtel_qh *qh = &gu.qh[2];
++	struct gtel_qtd *td = &gu.qtd[QTD_EP1_OUT];
++
++	if (!gu.online || gu.rx_armed) {
++		return;
++	}
++	gu_dcache_flush(gu.dma_va + DMA_RX_OFF, GTEL_RX_BUF_SIZE);
++	td->next = TERMINATE;
++	td->info = INFO_BYTES(GTEL_RX_BUF_SIZE) | INFO_IOC | INFO_ACTIVE;
++	gtel_qtd_set_pages(td, gu.dma_pa + DMA_RX_OFF);
++	gu_dcache_flush((vm_offset_t)td, sizeof(*td));
++
++	qh->next = gtel_qtd_pa(QTD_EP1_OUT);
++	qh->info = 0;
++	gu_dcache_flush((vm_offset_t)qh, sizeof(*qh));
++
++	usb_wr(USB_ENDPTPRIME, EPT_RX(1));
++	gu.rx_armed = true;
++}
++
++static void handle_bus_reset(void);
++static void poll_ep0_events(void);
++
++/* Transmit len bytes already placed in DMA_TX_OFF (0 <= len <= GTEL_TX_BUF_SIZE) */
++static int
++ep1_tx_buf_sync(uint32_t len)
++{
++	uint32_t rem = len;
++	uint32_t off = 0;
++	uint32_t n_qtd = 0;
++	uint32_t sess = gu.session;
++
++	if (!gu.online) {
++		return -1;
++	}
++	gu_dcache_clean(gu.dma_va + DMA_TX_OFF, len);
++
++	do {
++		uint32_t xfer = (rem > MAX_TD_XFER_SIZE) ? MAX_TD_XFER_SIZE : rem;
++		struct gtel_qtd *td = &gu.qtd[QTD_EP1_IN_BASE + n_qtd];
++		bool last = (rem == xfer);
++
++		td->next = last ? TERMINATE : gtel_qtd_pa(QTD_EP1_IN_BASE + n_qtd + 1u);
++		td->info = INFO_BYTES(xfer) | INFO_ACTIVE | (last ? INFO_IOC : 0u);
++		gtel_qtd_set_pages(td, gu.dma_pa + DMA_TX_OFF + off);
++
++		off += xfer;
++		rem -= xfer;
++		n_qtd++;
++	} while (rem > 0 && n_qtd < MAX_TX_QTDS);
++
++	gu_dcache_flush((vm_offset_t)&gu.qtd[QTD_EP1_IN_BASE],
++	    (size_t)n_qtd * sizeof(struct gtel_qtd));
++
++	gu.qh[3].next = gtel_qtd_pa(QTD_EP1_IN_BASE);
++	gu.qh[3].info = 0;
++	gu_dcache_flush((vm_offset_t)&gu.qh[3], sizeof(struct gtel_qh));
++
++	usb_wr(USB_ENDPTCOMPLETE, EPT_TX(1));
++	usb_wr(USB_ENDPTPRIME, EPT_TX(1));
++
++	/* Poll tightly for up to 5 ms, then 1 ms sleep ticks up to 5 s */
++	for (uint32_t step = 0; step < 5500; step++) {
++		uint32_t sts = usb_rd(USB_USBSTS);
++		if (sts & STS_URI) {
++			usb_wr(USB_USBSTS, STS_URI);
++			handle_bus_reset();
++			return -1;
++		}
++		if (sts & STS_PCI) {
++			usb_wr(USB_USBSTS, STS_PCI);
++			gu.highspeed = (((usb_rd(USB_PORTSC) >> PORTSC_PSPD_SHIFT) & 3u) == PORTSC_PSPD_HS);
++		}
++		if (usb_rd(USB_ENDPTCOMPLETE) & EPT_TX(1)) {
++			usb_wr(USB_ENDPTCOMPLETE, EPT_TX(1));
++			gu_dcache_flush((vm_offset_t)&gu.qtd[QTD_EP1_IN_BASE],
++			    (size_t)n_qtd * sizeof(struct gtel_qtd));
++			for (uint32_t q = 0; q < n_qtd; q++) {
++				if (gu.qtd[QTD_EP1_IN_BASE + q].info & INFO_ERR_MASK) {
++					return -1;
++				}
++			}
++			return 0;
++		}
++		poll_ep0_events();
++		if (!gu.online || gu.session != sess) {
++			return -1;
++		}
++		if (step < 500) {
++			delay(10);
++		} else {
++			gtel_usb_sleep_ms(1);
++		}
++	}
++
++	ep_flush(EPT_TX(1));
++	return -1;
++}
++
++static int
++ep1_tx_sync(const void *data, uint32_t len)
++{
++	if (len > GTEL_TX_BUF_SIZE) {
++		len = GTEL_TX_BUF_SIZE;
++	}
++	if (len > 0) {
++		memcpy((void *)(gu.dma_va + DMA_TX_OFF), data, len);
++	}
++	return ep1_tx_buf_sync(len);
++}
++
++/* ---- USB reset & EP0 setup ---- */
++
++static void
++handle_bus_reset(void)
++{
++	usb_wr(USB_ENDPTCOMPLETE, usb_rd(USB_ENDPTCOMPLETE));
++	usb_wr(USB_ENDPTSETUPSTAT, usb_rd(USB_ENDPTSETUPSTAT));
++	ep_flush(0xffffffffu);
++	usb_wr(USB_ENDPTCTRL(1), 0u);
++	gu.online = false;
++	gu.config_val = 0;
++	gu.ep0_state = EP0_IDLE;
++	gu.rx_armed = false;
++	gu.session++;
++}
++
++static uint32_t
++build_string_desc(uint8_t idx, uint8_t *out, uint32_t max_out)
++{
++	if (idx == 0) {
++		if (max_out < 4) {
++			return 0;
++		}
++		out[0] = 4;
++		out[1] = USB_DESC_STRING;
++		out[2] = 0x09;
++		out[3] = 0x04;
++		return 4;
++	}
++	if (idx >= (uint8_t)(sizeof(gtel_usb_strings) / sizeof(gtel_usb_strings[0]))) {
++		return 0;
++	}
++	const char *str = gtel_usb_strings[idx];
++	uint32_t pos = 2;
++	while (*str && pos + 2 <= max_out) {
++		out[pos++] = (uint8_t)*str++;
++		out[pos++] = 0;
++	}
++	out[0] = (uint8_t)pos;
++	out[1] = USB_DESC_STRING;
++	return pos;
++}
++
++static void
++handle_setup(void)
++{
++	struct usb_setup_pkt s;
++
++	if (gu.ep0_state != EP0_IDLE) {
++		ep_flush(EPT_TX(0) | EPT_RX(0));
++		usb_wr(USB_ENDPTCOMPLETE, EPT_TX(0) | EPT_RX(0));
++		gu.ep0_state = EP0_IDLE;
++	}
++
++	/* ChipIdea Setup Tripwire read */
++	for (int tries = 0; tries < 16; tries++) {
++		usb_wr(USB_ENDPTSETUPSTAT, EPT_RX(0));
++		usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) | USBCMD_SUTW);
++		gu_dcache_flush((vm_offset_t)&gu.qh[0], sizeof(struct gtel_qh));
++		memcpy(&s, gu.qh[0].setup_data, sizeof(s));
++		if (usb_rd(USB_USBCMD) & USBCMD_SUTW) {
++			break;
++		}
++	}
++	usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) & ~USBCMD_SUTW);
++
++	uint16_t req_id = (uint16_t)(((uint16_t)s.type << 8) | s.request);
++	switch (req_id) {
++	case ((0x80u << 8) | USB_REQ_GET_STATUS):
++	case ((0x81u << 8) | USB_REQ_GET_STATUS):
++	case ((0x82u << 8) | USB_REQ_GET_STATUS): {
++		uint8_t zero[2] = { 0, 0 };
++		if (s.length == 2) {
++			ep0_tx(zero, 2u);
++			return;
++		}
++		break;
++	}
++	case ((0x80u << 8) | USB_REQ_GET_DESCRIPTOR): {
++		uint8_t dtype = (uint8_t)(s.value >> 8);
++		uint8_t didx = (uint8_t)(s.value & 0xffu);
++		if (dtype == USB_DESC_DEVICE && didx == 0) {
++			uint32_t len = (s.length < sizeof(gtel_dev_desc))
++			    ? s.length : (uint32_t)sizeof(gtel_dev_desc);
++			ep0_tx(gtel_dev_desc, len);
++			return;
++		}
++		if (dtype == USB_DESC_CONFIGURATION && didx == 0) {
++			uint8_t cfg[sizeof(gtel_cfg_desc_tmpl)];
++			uint16_t maxpkt;
++			gu.highspeed = (((usb_rd(USB_PORTSC) >> PORTSC_PSPD_SHIFT) & 3u) == PORTSC_PSPD_HS);
++			maxpkt = gu.highspeed ? 512u : 64u;
++			memcpy(cfg, gtel_cfg_desc_tmpl, sizeof(cfg));
++			cfg[22] = (uint8_t)(maxpkt & 0xffu);
++			cfg[23] = (uint8_t)(maxpkt >> 8);
++			cfg[29] = (uint8_t)(maxpkt & 0xffu);
++			cfg[30] = (uint8_t)(maxpkt >> 8);
++			uint32_t len = (s.length < sizeof(cfg))
++			    ? s.length : (uint32_t)sizeof(cfg);
++			ep0_tx(cfg, len);
++			return;
++		}
++		if (dtype == USB_DESC_STRING) {
++			uint8_t sbuf[128];
++			uint32_t slen = build_string_desc(didx, sbuf, sizeof(sbuf));
++			if (slen > 0) {
++				uint32_t len = (s.length < slen) ? s.length : slen;
++				ep0_tx(sbuf, len);
++				return;
++			}
++		}
++		break;
++	}
++	case ((0x00u << 8) | USB_REQ_SET_ADDRESS): {
++		/* Bit 24 delays address change until after the status IN ACK */
++		usb_wr(USB_DEVICEADDR, (((uint32_t)(s.value & 0x7fu)) << 25) | (1u << 24));
++		ep0_ack();
++		return;
++	}
++	case ((0x80u << 8) | USB_REQ_GET_CONFIGURATION): {
++		if (s.value == 0 && s.index == 0 && s.length == 1) {
++			ep0_tx(&gu.config_val, 1u);
++			return;
++		}
++		break;
++	}
++	case ((0x00u << 8) | USB_REQ_SET_CONFIGURATION): {
++		if (s.value == 1) {
++			gu.highspeed = (((usb_rd(USB_PORTSC) >> PORTSC_PSPD_SHIFT) & 3u) == PORTSC_PSPD_HS);
++			uint32_t maxpkt = gu.highspeed ? 512u : 64u;
++			ep_flush(EPT_TX(1) | EPT_RX(1));
++			usb_wr(USB_ENDPTCOMPLETE, EPT_TX(1) | EPT_RX(1));
++			gu.qh[2].config = CONFIG_MAX_PKT(maxpkt) | CONFIG_ZLT;
++			gu.qh[3].config = CONFIG_MAX_PKT(maxpkt) | CONFIG_ZLT;
++			gu_dcache_flush((vm_offset_t)&gu.qh[2], 2u * sizeof(struct gtel_qh));
++			usb_wr(USB_ENDPTCTRL(1),
++			    CTRL_TXE | CTRL_TXR | CTRL_TXT_BULK |
++			    CTRL_RXE | CTRL_RXR | CTRL_RXT_BULK);
++			gu.config_val = 1;
++			gu.online = true;
++			gu.rx_armed = false;
++			gu.session++;
++			ep0_ack();
++			ep1_arm_rx();
++			printf("gtel usb: configured (%s)\n",
++			    gu.highspeed ? "high-speed" : "full-speed");
++			return;
++		}
++		if (s.value == 0) {
++			ep_flush(EPT_TX(1) | EPT_RX(1));
++			usb_wr(USB_ENDPTCTRL(1), 0u);
++			gu.config_val = 0;
++			gu.online = false;
++			gu.rx_armed = false;
++			gu.session++;
++			ep0_ack();
++			return;
++		}
++		break;
++	}
++	case ((0x81u << 8) | USB_REQ_GET_INTERFACE): {
++		if (s.length == 1) {
++			uint8_t alt = 0;
++			ep0_tx(&alt, 1u);
++			return;
++		}
++		break;
++	}
++	case ((0x01u << 8) | USB_REQ_SET_INTERFACE): {
++		if (s.value == 0 && s.index == 0) {
++			ep0_ack();
++			return;
++		}
++		break;
++	}
++	case ((0x00u << 8) | USB_REQ_SET_FEATURE): {
++		ep0_ack();
++		return;
++	}
++	case ((0x02u << 8) | USB_REQ_CLEAR_FEATURE): {
++		if (s.value == 0 && s.length == 0) {
++			uint32_t ep_num = s.index & 0x0fu;
++			bool ep_in = (s.index & 0x80u) != 0;
++			if (ep_num == 1) {
++				if (ep_in) {
++					ep_flush(EPT_TX(1));
++					usb_wr(USB_ENDPTCTRL(1),
++					    (usb_rd(USB_ENDPTCTRL(1)) & ~CTRL_TXS) |
++					    CTRL_TXE | CTRL_TXR | CTRL_TXT_BULK);
++				} else {
++					ep_flush(EPT_RX(1));
++					usb_wr(USB_ENDPTCTRL(1),
++					    (usb_rd(USB_ENDPTCTRL(1)) & ~CTRL_RXS) |
++					    CTRL_RXE | CTRL_RXR | CTRL_RXT_BULK);
++					gu.rx_armed = false;
++					ep1_arm_rx();
++				}
++				ep0_ack();
++				return;
++			}
++			if (ep_num == 0) {
++				ep0_ack();
++				return;
++			}
++		}
++		break;
++	}
++	default:
++		break;
++	}
++
++	ep0_stall();
++}
++
++static void
++poll_ep0_events(void)
++{
++	uint32_t sstat = usb_rd(USB_ENDPTSETUPSTAT);
++	uint32_t comp = usb_rd(USB_ENDPTCOMPLETE) & (EPT_TX(0) | EPT_RX(0));
++
++	if (comp) {
++		usb_wr(USB_ENDPTCOMPLETE, comp);
++		if (!(sstat & EPT_RX(0))) {
++			if ((comp & EPT_TX(0)) && gu.ep0_state == EP0_TX_DATA) {
++				gu.ep0_state = EP0_RX_STATUS;
++				ep0_prime(0u, QTD_EP0_OUT, gu.dma_pa + DMA_EP0_OFF, 0u);
++			} else if (((comp & EPT_TX(0)) && gu.ep0_state == EP0_TX_ACK) ||
++			    ((comp & EPT_RX(0)) && gu.ep0_state == EP0_RX_STATUS)) {
++				gu.ep0_state = EP0_IDLE;
++			}
++		}
++	}
++
++	if (sstat & EPT_RX(0)) {
++		handle_setup();
++	}
++}
++
++/* ---- Fastboot command handlers ---- */
++
++static void
++fastboot_upload(void)
++{
++	uint64_t end = sweet_log_position();
++	uint64_t avail = (end > GTEL_LOG_RING_SIZE) ? GTEL_LOG_RING_SIZE : end;
++	uint64_t pos = end - avail;
++	uint64_t rem = avail;
++	char hdr[16];
++
++	snprintf(hdr, sizeof(hdr), "DATA%08x", (unsigned)avail);
++	if (ep1_tx_sync(hdr, (uint32_t)strlen(hdr)) != 0) {
++		return;
++	}
++
++	while (rem > 0) {
++		uint32_t chunk = (uint32_t)(rem > GTEL_TX_BUF_SIZE ? GTEL_TX_BUF_SIZE : rem);
++		char *dst = (char *)(gu.dma_va + DMA_TX_OFF);
++		uint32_t copied = 0;
++
++		while (copied < chunk) {
++			uint32_t n = sweet_log_copy(&pos, dst + copied, chunk - copied);
++			if (n == 0) {
++				memset(dst + copied, ' ', chunk - copied);
++				break;
++			}
++			copied += n;
++		}
++		if (ep1_tx_buf_sync(chunk) != 0) {
++			return;
++		}
++		rem -= chunk;
++	}
++
++	(void)ep1_tx_sync("OKAY", 4u);
++}
++
++static void
++fastboot_oem_dmesg(void)
++{
++	uint64_t end = sweet_log_position();
++	uint64_t pos = (end > GTEL_LOG_RING_SIZE) ? (end - GTEL_LOG_RING_SIZE) : 0;
++	char raw[512];
++	char pkt[65];
++	size_t line_len = 0;
++
++	memcpy(pkt, "INFO", 4);
++	while (pos < end) {
++		uint64_t left = end - pos;
++		uint32_t want = (uint32_t)(left > sizeof(raw) ? sizeof(raw) : left);
++		uint32_t got = sweet_log_copy(&pos, raw, want);
++		if (got == 0) {
++			break;
++		}
++		for (uint32_t k = 0; k < got; k++) {
++			char c = raw[k];
++			if (c == '\r') {
++				continue;
++			}
++			if (c == '\n') {
++				if (line_len > 0) {
++					if (ep1_tx_sync(pkt, (uint32_t)(4u + line_len)) != 0) {
++						return;
++					}
++					line_len = 0;
++				}
++				continue;
++			}
++			pkt[4u + line_len++] = c;
++			if (line_len == 60u) {
++				if (ep1_tx_sync(pkt, 64u) != 0) {
++					return;
++				}
++				line_len = 0;
++			}
++		}
++	}
++	if (line_len > 0) {
++		if (ep1_tx_sync(pkt, (uint32_t)(4u + line_len)) != 0) {
++			return;
++		}
++	}
++	(void)ep1_tx_sync("OKAY", 4u);
++}
++
++static void
++fastboot_handle_cmd(const char *cmd)
++{
++	if (strcmp(cmd, "getvar:product") == 0) {
++		(void)ep1_tx_sync("OKAYgtel-xnu-ios", 16u);
++	} else if (strcmp(cmd, "getvar:version") == 0) {
++		(void)ep1_tx_sync("OKAY0.5", 7u);
++	} else if (strcmp(cmd, "getvar:log-size") == 0) {
++		char resp[48];
++		snprintf(resp, sizeof(resp), "OKAY%llu", (unsigned long long)sweet_log_position());
++		(void)ep1_tx_sync(resp, (uint32_t)strlen(resp));
++	} else if (strcmp(cmd, "getvar:all") == 0) {
++		char resp[64];
++		(void)ep1_tx_sync("INFOversion:0.5", 15u);
++		(void)ep1_tx_sync("INFOproduct:gtel-xnu-ios", 24u);
++		snprintf(resp, sizeof(resp), "INFOlog-size:%llu",
++		    (unsigned long long)sweet_log_position());
++		(void)ep1_tx_sync(resp, (uint32_t)strlen(resp));
++		(void)ep1_tx_sync("OKAY", 4u);
++	} else if (strncmp(cmd, "getvar:", 7) == 0) {
++		(void)ep1_tx_sync("OKAY", 4u);
++	} else if (strcmp(cmd, "poweroff") == 0 ||
++	    strcmp(cmd, "oem poweroff") == 0 ||
++	    strcmp(cmd, "oem shutdown") == 0) {
++		(void)ep1_tx_sync("OKAY", 4u);
++		gtel_do_poweroff();
++	} else if (strcmp(cmd, "reboot") == 0 ||
++	    strcmp(cmd, "reboot-bootloader") == 0 ||
++	    strcmp(cmd, "reboot bootloader") == 0 ||
++	    strcmp(cmd, "oem reboot") == 0) {
++		(void)ep1_tx_sync("OKAY", 4u);
++		gtel_do_reboot();
++	} else if (strcmp(cmd, "oem dmesg") == 0) {
++		fastboot_oem_dmesg();
++	} else if (strcmp(cmd, "upload") == 0) {
++		fastboot_upload();
++	} else if (strcmp(cmd, "oem help") == 0) {
++		(void)ep1_tx_sync("INFOgetvar:product|version|log-size|all", 39u);
++		(void)ep1_tx_sync("INFOupload | oem dmesg", 22u);
++		(void)ep1_tx_sync("INFOpoweroff | oem poweroff | oem shutdown", 42u);
++		(void)ep1_tx_sync("INFOreboot | reboot-bootloader | oem reboot", 43u);
++		(void)ep1_tx_sync("OKAY", 4u);
++	} else {
++		(void)ep1_tx_sync("FAILunknown command", 19u);
++	}
++}
++
++static void
++handle_ep1_rx(void)
++{
++	struct gtel_qtd *td = &gu.qtd[QTD_EP1_OUT];
++	uint32_t info;
++	uint32_t rem;
++	uint32_t actual;
++	char cmd[256];
++
++	usb_wr(USB_ENDPTCOMPLETE, EPT_RX(1));
++	gu.rx_armed = false;
++
++	for (int i = 0; i < 1000; i++) {
++		gu_dcache_flush((vm_offset_t)td, sizeof(*td));
++		if (!(td->info & INFO_ACTIVE)) {
++			break;
++		}
++		delay(1);
++	}
++	info = td->info;
++	if (info & INFO_ERR_MASK) {
++		ep1_arm_rx();
++		return;
++	}
++	rem = (info >> 16) & 0x7fffu;
++	actual = (rem <= GTEL_RX_BUF_SIZE) ? (GTEL_RX_BUF_SIZE - rem) : 0u;
++
++	if (actual > 0) {
++		gu_dcache_flush(gu.dma_va + DMA_RX_OFF, actual);
++		uint32_t copy_len = (actual < sizeof(cmd) - 1u) ? actual : (uint32_t)(sizeof(cmd) - 1u);
++		memcpy(cmd, (const void *)(gu.dma_va + DMA_RX_OFF), copy_len);
++		cmd[copy_len] = '\0';
++		fastboot_handle_cmd(cmd);
++	}
++
++	ep1_arm_rx();
++}
++
++/* ---- Clock, Controller Init & Polling Thread ---- */
++
++static void
++gtel_usb_clock_init(void)
++{
++	uint32_t cfg = gcc_rd(GCC_USB_HS_SYSTEM_CFG_RCGR);
++	if ((cfg & 0x71fu) != RCGR_CFG_80MHZ_GPLL0) {
++		gcc_wr(GCC_USB_HS_SYSTEM_CFG_RCGR, (cfg & ~0x71fu) | RCGR_CFG_80MHZ_GPLL0);
++		gcc_wr(GCC_USB_HS_SYSTEM_CMD_RCGR,
++		    gcc_rd(GCC_USB_HS_SYSTEM_CMD_RCGR) | RCGR_CMD_UPDATE);
++		for (int i = 0; i < 1000 && (gcc_rd(GCC_USB_HS_SYSTEM_CMD_RCGR) & RCGR_CMD_UPDATE); i++) {
++			delay(10);
++		}
++	}
++
++	/* Match lk2nd hsusb_clock_init: enable -> disable -> BCR reset -> enable */
++	gcc_wr(GCC_USB_HS_AHB_CBCR, gcc_rd(GCC_USB_HS_AHB_CBCR) | CBCR_CLK_ENABLE);
++	gcc_wr(GCC_USB_HS_SYSTEM_CBCR, gcc_rd(GCC_USB_HS_SYSTEM_CBCR) | CBCR_CLK_ENABLE);
++	gtel_usb_sleep_ms(20);
++
++	gcc_wr(GCC_USB_HS_AHB_CBCR, gcc_rd(GCC_USB_HS_AHB_CBCR) & ~CBCR_CLK_ENABLE);
++	gcc_wr(GCC_USB_HS_SYSTEM_CBCR, gcc_rd(GCC_USB_HS_SYSTEM_CBCR) & ~CBCR_CLK_ENABLE);
++	gtel_usb_sleep_ms(20);
++
++	gcc_wr(GCC_USB_HS_BCR, 1u);
++	gtel_usb_sleep_ms(20);
++	gcc_wr(GCC_USB_HS_BCR, 0u);
++	gtel_usb_sleep_ms(20);
++
++	gcc_wr(GCC_USB_HS_AHB_CBCR, gcc_rd(GCC_USB_HS_AHB_CBCR) | CBCR_CLK_ENABLE);
++	gcc_wr(GCC_USB_HS_SYSTEM_CBCR, gcc_rd(GCC_USB_HS_SYSTEM_CBCR) | CBCR_CLK_ENABLE);
++	for (int i = 0; i < 1000; i++) {
++		if (!(gcc_rd(GCC_USB_HS_AHB_CBCR) & CBCR_CLK_OFF) &&
++		    !(gcc_rd(GCC_USB_HS_SYSTEM_CBCR) & CBCR_CLK_OFF)) {
++			break;
++		}
++		delay(10);
++	}
++}
++
++static void
++gtel_usb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	if (gu.usb == 0 || gu.gcc == 0) {
++		return;
++	}
++	gtel_usb_clock_init();
++
++	/* Reset controller */
++	usb_wr(USB_USBCMD, USBCMD_ITC_8 | USBCMD_RESET);
++	gtel_usb_sleep_ms(20);
++	for (int i = 0; i < 50000 && (usb_rd(USB_USBCMD) & USBCMD_RESET); i++) {
++		delay(10);
++	}
++
++	/* Select ULPI PHY */
++	usb_wr(USB_PORTSC, PORTSC_PTS_ULPI);
++
++	/* MSM8916 target_usb_init: force VBUS session valid */
++	ulpi_write(ULPI_MISC_A_VBUSVLDEXTSEL | ULPI_MISC_A_VBUSVLDEXT, ULPI_MISC_A_SET);
++	usb_wr(USB_GENCONFIG_2, usb_rd(USB_GENCONFIG_2) | GEN2_SESS_VLD_CTRL_EN);
++	usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) | SESS_VLD_CTRL);
++
++	usb_wr(USB_SBUSCFG, 0x0u);
++	usb_wr(USB_AHB_MODE, 0x08u);
++
++	memset(gu.qh, 0, 32u * sizeof(struct gtel_qh));
++	gu.qh[0].config = CONFIG_MAX_PKT(64u) | CONFIG_ZLT | CONFIG_IOS;
++	gu.qh[1].config = CONFIG_MAX_PKT(64u) | CONFIG_ZLT;
++	gu_dcache_flush((vm_offset_t)gu.qh, 32u * sizeof(struct gtel_qh));
++
++	usb_wr(USB_ENDPOINTLISTADDR, gu.dma_pa + DMA_QH_OFF);
++	usb_wr(USB_USBMODE, USBMODE_DEVICE);
++	ep_flush(0xffffffffu);
++	gtel_usb_sleep_ms(20);
++
++	usb_wr(USB_USBSTS, usb_rd(USB_USBSTS));
++	usb_wr(USB_ENDPTSETUPSTAT, usb_rd(USB_ENDPTSETUPSTAT));
++	usb_wr(USB_ENDPTCOMPLETE, usb_rd(USB_ENDPTCOMPLETE));
++	usb_wr(USB_USBINTR, 0u);
++
++	/* Attach D+ pull-up while preserving SESS_VLD_CTRL */
++	usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) | USBCMD_ITC_8 | USBCMD_ATTACH);
++
++	printf("gtel usb: ChipIdea HS-USB ready (ID=0x%08x, DMA=0x%08x)\n",
++	    usb_rd(USB_ID), gu.dma_pa);
++
++	for (;;) {
++		uint32_t sts = usb_rd(USB_USBSTS);
++		if (sts) {
++			usb_wr(USB_USBSTS, sts);
++		}
++		if (sts & STS_URI) {
++			handle_bus_reset();
++			gtel_usb_sleep_ms(1);
++			continue;
++		}
++		if (sts & STS_PCI) {
++			gu.highspeed = (((usb_rd(USB_PORTSC) >> PORTSC_PSPD_SHIFT) & 3u) == PORTSC_PSPD_HS);
++		}
++		poll_ep0_events();
++		if (gu.online && (usb_rd(USB_ENDPTCOMPLETE) & EPT_RX(1))) {
++			handle_ep1_rx();
++		}
++		if (gu.ep0_state != EP0_IDLE) {
++			delay(50);
++		} else {
++			gtel_usb_sleep_ms(1);
++		}
++	}
++}
++
++void
++gtel_usb_start(void)
++{
++	static bool started;
++	DTEntry node;
++	uint32_t on = 1;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	/* Only run on gtel (MSM8916), never on sweet (/sweet-ufs) */
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) == kSuccess) {
++		return;
++	}
++	started = true;
++
++	/* Map MPM2_MPM_PS_HOLD early so halt_all_cpus(FALSE) never needs io_map */
++	if (gtel_ps_hold_reg == NULL) {
++		vm_offset_t psh = ml_io_map(MPM2_MPM_PS_HOLD_PA, 0x1000u);
++		if (psh != 0) {
++			gtel_ps_hold_reg = (volatile uint32_t *)psh;
++		}
++	}
++
++	PE_parse_boot_argn("gtelusb", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++
++	gu.gcc = ml_io_map(GCC_USB_BASE_PA, GCC_USB_SIZE);
++	gu.usb = ml_io_map(MSM_USB_BASE_PA, MSM_USB_SIZE);
++	if (gu.gcc == 0 || gu.usb == 0) {
++		printf("gtel usb: MMIO map failed\n");
++		return;
++	}
++
++	if (kmem_alloc_contig(kernel_map, &gu.dma_va, GTEL_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("gtel usb: contiguous DMA alloc failed\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gu.dma_va);
++	if (pn == 0) {
++		printf("gtel usb: pmap_find_phys failed\n");
++		return;
++	}
++	uint64_t pa = ptoa_64(pn);
++	if ((pa >> 32) != 0 || ((pa + GTEL_DMA_SIZE - 1u) >> 32) != 0) {
++		printf("gtel usb: DMA PA 0x%llx exceeds 32 bits\n", (unsigned long long)pa);
++		return;
++	}
++	gu.dma_pa = (uint32_t)pa;
++	gu.qh = (struct gtel_qh *)(gu.dma_va + DMA_QH_OFF);
++	gu.qtd = (struct gtel_qtd *)(gu.dma_va + DMA_QTD_OFF);
++
++	if (kernel_thread_start(gtel_usb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index bdf5f3b..709da27 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6955,6 +6955,9 @@ load_init_program(proc_t p)
+ 	/* gtel: probe the internal eMMC (read-only, logs the GPT) */
+ 	extern void gtel_mmc_probe(void);
+ 	gtel_mmc_probe();
++	/* gtel: start MSM8916 ChipIdea HS-USB fastboot gadget */
++	extern void gtel_usb_start(void);
++	gtel_usb_start();
+ #endif
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 3115a03..0cbcafe 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -742,6 +742,11 @@ ml_get_machine_mem(void)
+ 	return machine_info.memory_size;
+ }
+ 
++#if defined(SWEET)
++extern volatile uint32_t *gtel_ps_hold_reg;
++volatile uint32_t *gtel_ps_hold_reg = NULL;
++#endif
++
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+@@ -751,13 +756,27 @@ halt_all_cpus(boolean_t reboot)
+ 	 * gtel: the console log (sweetlog ring) is read back from DRAM by
+ 	 * tools/pull_log.py after a reset, and a reset drops dirty cache
+ 	 * lines: clean the whole data cache first. Then reset through PSCI
+-	 * SYSTEM_RESET instead of spinning, so a panic lands back in lk2nd.
++	 * SYSTEM_RESET or shut down through PSCI SYSTEM_OFF + PS_HOLD fallback.
+ 	 */
+-	printf(reboot ? "MACH Reboot (PSCI)\n" : "CPU halted\n");
++	printf(reboot ? "MACH Reboot (PSCI)\n" : "CPU halted (PSCI OFF)\n");
+ 	FlushPoC_Dcache();
+ 	if (reboot) {
+ 		register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
+ 		__asm__ volatile ("smc #0" : "+r"(x0) : : "memory");
++	} else {
++		register uint64_t x0 __asm__("x0") = 0x84000008;        /* PSCI SYSTEM_OFF */
++		register uint64_t x1 __asm__("x1") = 0;
++		register uint64_t x2 __asm__("x2") = 0;
++		register uint64_t x3 __asm__("x3") = 0;
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++		    :
++		    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++		      "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		if (gtel_ps_hold_reg != NULL) {
++			*gtel_ps_hold_reg = 0;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
+ 	}
+ #endif
+ 	if (reboot) {

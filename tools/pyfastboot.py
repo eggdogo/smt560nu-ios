@@ -79,18 +79,66 @@ class FastbootDevice:
                 break
         return "\n".join(res)
 
-    def upload(self):
+    def upload(self, timeout=5000):
         self.ep_out.write(b"upload")
-        resp = bytes(self.ep_in.read(512)).decode('utf-8', errors='ignore')
+        resp = bytes(self.ep_in.read(512, timeout=timeout)).decode('utf-8', errors='ignore')
         if not resp.startswith("DATA"):
             raise RuntimeError(f"Upload command failed: {resp}")
         size = int(resp[4:12], 16)
         data = bytearray()
         while len(data) < size:
-            chunk = self.ep_in.read(min(size - len(data), 65536))
+            chunk = self.ep_in.read(min(size - len(data), 65536), timeout=timeout)
             data.extend(chunk)
-        resp2 = bytes(self.ep_in.read(512)).decode('utf-8', errors='ignore')
+        resp2 = bytes(self.ep_in.read(512, timeout=timeout)).decode('utf-8', errors='ignore')
+        if not resp2.startswith("OKAY"):
+            raise RuntimeError(f"Upload trailing status failed: {resp2}")
         return bytes(data)
+
+    def dmesg(self):
+        return self.upload()
+
+    def poweroff(self):
+        try:
+            self.ep_out.write(b"poweroff")
+            while True:
+                resp = bytes(self.ep_in.read(512, timeout=5000)).decode('utf-8', errors='ignore')
+                if resp.startswith("INFO"):
+                    print(resp[4:].strip())
+                elif resp.startswith("OKAY"):
+                    msg = resp[4:].strip()
+                    print(f"OKAY {msg}" if msg else "OKAY")
+                    return True
+                elif resp.startswith("FAIL"):
+                    print(f"FAIL {resp[4:].strip()}")
+                    return False
+                else:
+                    print(resp.strip())
+                    return False
+        except Exception as e:
+            print(f"Device powered off (fastboot disconnected: {e})")
+            return True
+
+    def reboot(self, target=None):
+        cmd = "reboot" if not target else (target if target.startswith("reboot") else f"reboot-{target}")
+        try:
+            self.ep_out.write(cmd.encode())
+            while True:
+                resp = bytes(self.ep_in.read(512, timeout=5000)).decode('utf-8', errors='ignore')
+                if resp.startswith("INFO"):
+                    print(resp[4:].strip())
+                elif resp.startswith("OKAY"):
+                    msg = resp[4:].strip()
+                    print(f"OKAY {msg}" if msg else "OKAY")
+                    return True
+                elif resp.startswith("FAIL"):
+                    print(f"FAIL {resp[4:].strip()}")
+                    return False
+                else:
+                    print(resp.strip())
+                    return False
+        except Exception as e:
+            print(f"Device rebooted (fastboot disconnected: {e})")
+            return True
 
     def download(self, data):
         size = len(data)
@@ -141,6 +189,15 @@ def main():
     upload_cmd = sub.add_parser('upload')
     upload_cmd.add_argument('outfile', nargs='?', default='staged.bin')
 
+    dmesg_cmd = sub.add_parser('dmesg')
+    dmesg_cmd.add_argument('outfile', nargs='?', help='Optional output file path')
+    dmesg_cmd.add_argument('-o', '--out', dest='out_flag', help='Write log bytes to file')
+
+    sub.add_parser('poweroff')
+    reboot_cmd = sub.add_parser('reboot')
+    reboot_cmd.add_argument('target', nargs='?', help='Optional reboot target (e.g. bootloader)')
+    sub.add_parser('reboot-bootloader')
+
     args = p.parse_args()
 
     try:
@@ -166,6 +223,28 @@ def main():
         with open(args.outfile, 'wb') as f:
             f.write(data)
         print(f"Fetched {len(data)} bytes to {args.outfile}")
+
+    elif args.command == 'dmesg':
+        data = fb.dmesg()
+        out = args.out_flag or args.outfile
+        if out:
+            with open(out, 'wb') as f:
+                f.write(data)
+            print(f"Wrote {len(data)} bytes to {out}")
+        else:
+            sys.stdout.write(data.decode('utf-8', errors='replace'))
+
+    elif args.command == 'poweroff':
+        if not fb.poweroff():
+            sys.exit(1)
+
+    elif args.command == 'reboot':
+        if not fb.reboot(args.target):
+            sys.exit(1)
+
+    elif args.command == 'reboot-bootloader':
+        if not fb.reboot('bootloader'):
+            sys.exit(1)
 
     elif args.command == 'boot':
         ok = fb.boot(args.image)
