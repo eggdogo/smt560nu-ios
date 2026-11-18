@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Binary-patch 0107 (gtel USB fastboot + poweroff) and 0108 (iOS 12 0x278 SwapEnd)
-directly into kernel.development.sweet so it can boot locally without waiting on CI.
+"""Binary-patch 0107 (gtel USB fastboot + poweroff), 0108 (iOS 12 0x278 SwapEnd),
+and 0109 (display modes and backboardd appointment) into kernel.development.sweet.
 """
 import os
 import shutil
@@ -10,15 +10,18 @@ import sys
 
 PROJ = r'C:\Users\Avett\Documents\Projects\iosont560nu'
 PATCH_0107 = r'C:\Users\Avett\Documents\GitHub\smt560nu-ios\xnu\patches\0107-gtel-usb-fastboot.patch'
+SRC_DISP = os.path.join(PROJ, 'tools', 'gtel_display.c')
 KERN = os.path.join(PROJ, 'kernel.development.sweet')
 BAK = KERN + '.pre_0107_0108'
 SCRATCH = r'C:\Users\Avett\.gemini\antigravity\brain\930aafe1-be5f-48c3-8932-b0d0a6bd3c94\scratch'
 
-# Unused sweet_usb slot inside __TEXT_EXEC and _ud slot inside __DATA.__bss
 CODE_BASE = 0xFFFFFFF0074936B0
 CODE_MAX = 0x1D60  # 7520 bytes: 0xfffffff0074936b0 .. 0xfffffff007495410
 BSS_BASE = 0xFFFFFFF00803AE38
 BSS_MAX = 0x368    # 872 bytes:  0xfffffff00803ae38 .. 0xfffffff00803b1a0
+
+DISP_CODE_BASE = 0xFFFFFFF00748CD90
+DISP_CODE_MAX = 0x1000  # 4096 bytes: 0xfffffff00748cd90 .. 0xfffffff00748dd90
 
 TEXT_EXEC_VA = 0xFFFFFFF007260000
 TEXT_EXEC_FOFF = 0x25C000
@@ -51,6 +54,24 @@ EXT_SYMS = {
     '_sweet_log_position':        0xFFFFFFF00748AB30,
     '_thread_block':              0xFFFFFFF0072DAEB0,
     '_thread_deallocate':         0xFFFFFFF0072FF8C0,
+    # Display & VFS symbols
+    '_OSDictionary_withCapacity':        0xFFFFFFF007920850,
+    '_OSDictionary_setObject':          0xFFFFFFF007921350,
+    '_OSArray_withCapacity':             0xFFFFFFF00791CB30,
+    '_OSArray_setObject':               0xFFFFFFF00791CF50,
+    '_OSNumber_withNumber':              0xFFFFFFF00793C8C0,
+    '_IORegistryEntry_setProperty':     0xFFFFFFF0079845B0,
+    '_IORegistryEntry_setPropertyBool': 0xFFFFFFF0079846B0,
+    '_OSObject_release':                0xFFFFFFF00791C060,
+    '_VNOP_FSYNC':                       0xFFFFFFF0074EC5B0,
+    '_vfs_context_kernel':              0xFFFFFFF0074E9BA0,
+    '_vfs_context_proc':                0xFFFFFFF0074E9800,
+    '_vfs_context_ucred':               0xFFFFFFF0074E9C20,
+    '_vn_rdwr':                         0xFFFFFFF0074E2760,
+    '_vnode_close':                     0xFFFFFFF0074C1740,
+    '_vnode_open':                      0xFFFFFFF0074C1660,
+    '_bzero':                           0xFFFFFFF007B1F580,
+    '_rootvnode':                       0xFFFFFFF007BCF7F8,
 }
 
 DARWIN_HDR = r'''
@@ -154,6 +175,17 @@ def encode_bl(pc, tgt, link=True):
     return (0x94000000 if link else 0x14000000) | (off & 0x3FFFFFF)
 
 
+def encode_b_cond(pc, tgt, cond):
+    disp = (tgt - pc) >> 2
+    assert -(1 << 18) <= disp < (1 << 18), f'b.cond out of range {pc:#x} -> {tgt:#x}'
+    return 0x54000000 | ((disp & 0x7FFFF) << 5) | (cond & 0xF)
+
+
+def to_wsl(p):
+    p = p.replace('\\', '/')
+    return '/mnt/' + p[0].lower() + p[2:]
+
+
 def compile_gtel_usb():
     with open(PATCH_0107, 'r', encoding='utf-8') as f:
         lines = f.read().splitlines()
@@ -174,10 +206,6 @@ def compile_gtel_usb():
     with open(src_win, 'w', encoding='utf-8', newline='\n') as wf:
         wf.write(DARWIN_HDR + body + '\n')
 
-    def to_wsl(p):
-        p = p.replace('\\', '/')
-        return '/mnt/' + p[0].lower() + p[2:]
-
     subprocess.check_call([
         'wsl', '-e', 'clang',
         '--target=arm64-apple-macos14.0', '-mkernel',
@@ -188,17 +216,30 @@ def compile_gtel_usb():
     return obj_win
 
 
-def relocate_macho(obj_path):
+def compile_gtel_display():
+    os.makedirs(SCRATCH, exist_ok=True)
+    obj_win = os.path.join(SCRATCH, 'gtel_display.o')
+    subprocess.check_call([
+        'wsl', '-e', 'clang',
+        '--target=arm64-apple-macos14.0', '-mkernel',
+        '-mcpu=cortex-a53', '-march=armv8-a+crypto', '-Os',
+        '-fno-stack-protector', '-ffreestanding', '-fno-builtin',
+        '-c', to_wsl(SRC_DISP), '-o', to_wsl(obj_win),
+    ])
+    return obj_win
+
+
+def relocate_macho_file(obj_path, code_base, code_max, bss_base=0, bss_max=0):
     buf = open(obj_path, 'rb').read()
     magic, _, _, _, ncmds, _, _, _ = struct.unpack_from('<8I', buf, 0)
     assert magic == 0xFEEDFACF, f'bad Mach-O magic {magic:#x}'
 
-    sections = []  # 1-based in n_sect / non-extern relocs
+    sections = []
     symtab_info = None
     off = 32
     for _ in range(ncmds):
         cmd, sz = struct.unpack_from('<II', buf, off)
-        if cmd == 0x19:  # LC_SEGMENT_64
+        if cmd == 0x19:
             nsects = struct.unpack_from('<I', buf, off + 64)[0]
             for i in range(nsects):
                 so = off + 72 + i * 80
@@ -206,18 +247,12 @@ def relocate_macho(obj_path):
                 seg = buf[so + 16:so + 32].split(b'\x00')[0].decode()
                 addr, size, foff, align, reloff, nreloc, flags = struct.unpack_from('<QQIIIII', buf, so + 32)
                 sections.append({
-                    'seg': seg,
-                    'sect': sect,
-                    'orig_addr': addr,
-                    'size': size,
-                    'foff': foff,
-                    'align': 1 << align,
-                    'reloff': reloff,
-                    'nreloc': nreloc,
-                    'flags': flags,
-                    'is_zerofill': (flags & 0xFF) == 1,  # S_ZEROFILL
+                    'seg': seg, 'sect': sect, 'orig_addr': addr, 'size': size,
+                    'foff': foff, 'align': 1 << align, 'reloff': reloff,
+                    'nreloc': nreloc, 'flags': flags,
+                    'is_zerofill': (flags & 0xFF) == 1,
                 })
-        elif cmd == 0x02:  # LC_SYMTAB
+        elif cmd == 0x02:
             symtab_info = struct.unpack_from('<IIII', buf, off + 8)
         off += sz
 
@@ -227,15 +262,8 @@ def relocate_macho(obj_path):
         strx, n_type, n_sect, n_desc, n_value = struct.unpack_from('<IBBHQ', buf, symoff + i * 16)
         end = buf.find(b'\x00', stroff + strx)
         name = buf[stroff + strx:end].decode('latin1')
-        syms.append({
-            'name': name,
-            'type': n_type,
-            'sect': n_sect,
-            'desc': n_desc,
-            'val': n_value,
-        })
+        syms.append({'name': name, 'type': n_type, 'sect': n_sect, 'desc': n_desc, 'val': n_value})
 
-    # Place non-zerofill sections into code_blob starting at CODE_BASE (put __text first)
     code_blob = bytearray()
     ordered_non_zf = [i for i, s in enumerate(sections) if not s['is_zerofill'] and s['sect'] == '__text'] + \
                      [i for i, s in enumerate(sections) if not s['is_zerofill'] and s['sect'] != '__text']
@@ -244,35 +272,40 @@ def relocate_macho(obj_path):
         pad = (-len(code_blob)) & (max(s['align'], 4) - 1)
         code_blob.extend(b'\x00' * pad)
         s['new_off'] = len(code_blob)
-        s['new_va'] = CODE_BASE + s['new_off']
+        s['new_va'] = code_base + s['new_off']
         code_blob.extend(buf[s['foff']:s['foff'] + s['size']])
 
-    # Place zerofill sections + tentative common symbols into BSS_BASE
-    bss_cur = BSS_BASE
+    bss_cur = bss_base
     for s in sections:
         if s['is_zerofill']:
             bss_cur = (bss_cur + s['align'] - 1) & ~(s['align'] - 1)
             s['new_va'] = bss_cur
             bss_cur += s['size']
 
-    # Resolve all symbol VAs
     sym_vas = []
+    sym_map = {}
     for sym in syms:
-        t = sym['type'] & 0x0E  # N_TYPE
-        if t == 0x0E:  # N_SECT
+        t = sym['type'] & 0x0E
+        if t == 0x0E:
             s = sections[sym['sect'] - 1]
-            sym_vas.append(s['new_va'] + (sym['val'] - s['orig_addr']))
-        elif t == 0x00 and sym['val'] != 0:  # N_UNDF tentative common (e.g. gtel_ps_hold_reg)
+            va = s['new_va'] + (sym['val'] - s['orig_addr'])
+            sym_vas.append(va)
+            sym_map[sym['name']] = va
+        elif t == 0x00 and sym['val'] != 0:
             bss_cur = (bss_cur + 7) & ~7
             va = bss_cur
             bss_cur += sym['val']
             sym_vas.append(va)
+            sym_map[sym['name']] = va
         elif sym['name'] in EXT_SYMS:
-            sym_vas.append(EXT_SYMS[sym['name']])
+            va = EXT_SYMS[sym['name']]
+            sym_vas.append(va)
+            sym_map[sym['name']] = va
         else:
-            raise RuntimeError(f'Unresolved external symbol in gtel_usb.o: {sym}')
+            raise RuntimeError(f'Unresolved external symbol in {os.path.basename(obj_path)}: {sym}')
 
-    assert bss_cur - BSS_BASE <= BSS_MAX, f'BSS overflow: {bss_cur - BSS_BASE} > {BSS_MAX}'
+    if bss_max > 0:
+        assert bss_cur - bss_base <= bss_max, f'BSS overflow: {bss_cur - bss_base} > {bss_max}'
 
     def orig_va_to_new_va(ova):
         for s in sections:
@@ -280,19 +313,16 @@ def relocate_macho(obj_path):
                 return s['new_va'] + (ova - s['orig_addr'])
         raise RuntimeError(f'Cannot map .o VA {ova:#x}')
 
-    # Allocate 8-byte GOT entries inside code_blob on demand
     got_map = {}
-
     def get_got_va(target_va):
         if target_va not in got_map:
             pad = (-len(code_blob)) & 7
             code_blob.extend(b'\x00' * pad)
             off_in_blob = len(code_blob)
             code_blob.extend(struct.pack('<Q', target_va))
-            got_map[target_va] = CODE_BASE + off_in_blob
+            got_map[target_va] = code_base + off_in_blob
         return got_map[target_va]
 
-    # Apply ARM64 Mach-O relocations per non-zerofill section
     for s in sections:
         if s['is_zerofill'] or s['nreloc'] == 0:
             continue
@@ -306,7 +336,7 @@ def relocate_macho(obj_path):
             r_extern = (r_info >> 27) & 1
             r_type = (r_info >> 28) & 0xF
 
-            if r_type == 10:  # ARM64_RELOC_ADDEND
+            if r_type == 10:
                 assert not has_addend
                 addend = r_sym if r_sym < 0x800000 else r_sym - 0x1000000
                 has_addend = True
@@ -317,28 +347,27 @@ def relocate_macho(obj_path):
             has_addend = False
 
             blob_off = s['new_off'] + r_addr
-            pc = CODE_BASE + blob_off
+            pc = code_base + blob_off
 
             if r_extern:
                 target = sym_vas[r_sym]
             else:
-                # Non-extern: r_sym is 1-based section index; raw field holds original VA
                 if r_type == 0 and r_len == 3:
                     orig_ptr = struct.unpack_from('<Q', code_blob, blob_off)[0]
                     target = orig_va_to_new_va(orig_ptr)
                 else:
                     target = sections[r_sym - 1]['new_va']
 
-            if r_type == 0:  # ARM64_RELOC_UNSIGNED
-                assert r_len == 3, f'unexpected unsigned r_len={r_len}'
+            if r_type == 0:
+                assert r_len == 3
                 struct.pack_into('<Q', code_blob, blob_off, target + cur_addend)
-            elif r_type == 2:  # ARM64_RELOC_BRANCH26
+            elif r_type == 2:
                 insn = struct.unpack_from('<I', code_blob, blob_off)[0]
                 disp = (target + cur_addend - pc) >> 2
                 assert -(1 << 25) <= disp < (1 << 25), f'branch26 overflow at {pc:#x} -> {target + cur_addend:#x}'
                 insn = (insn & 0xFC000000) | (disp & 0x03FFFFFF)
                 struct.pack_into('<I', code_blob, blob_off, insn)
-            elif r_type in (3, 5):  # PAGE21 / GOT_LOAD_PAGE21
+            elif r_type in (3, 5):
                 eff = get_got_va(target) if r_type == 5 else (target + cur_addend)
                 page_diff = ((eff & ~0xFFF) - (pc & ~0xFFF)) >> 12
                 immlo = page_diff & 0x3
@@ -346,15 +375,12 @@ def relocate_macho(obj_path):
                 insn = struct.unpack_from('<I', code_blob, blob_off)[0]
                 insn = (insn & 0x9F00001F) | (immlo << 29) | (immhi << 5)
                 struct.pack_into('<I', code_blob, blob_off, insn)
-            elif r_type in (4, 6):  # PAGEOFF12 / GOT_LOAD_PAGEOFF12
+            elif r_type in (4, 6):
                 eff = get_got_va(target) if r_type == 6 else (target + cur_addend)
                 off12 = eff & 0xFFF
                 insn = struct.unpack_from('<I', code_blob, blob_off)[0]
-                if (insn & 0x3B000000) == 0x39000000:  # LDR/STR unsigned offset
-                    if (insn & 0x04800000) == 0x04800000:
-                        shift = 4
-                    else:
-                        shift = (insn >> 30) & 3
+                if (insn & 0x3B000000) == 0x39000000:
+                    shift = 4 if (insn & 0x04800000) == 0x04800000 else (insn >> 30) & 3
                     assert (off12 & ((1 << shift) - 1)) == 0, f'unaligned off12 {off12:#x} shift={shift}'
                     imm12 = off12 >> shift
                 else:
@@ -362,23 +388,10 @@ def relocate_macho(obj_path):
                 insn = (insn & 0xFFC003FF) | (imm12 << 10)
                 struct.pack_into('<I', code_blob, blob_off, insn)
             else:
-                raise RuntimeError(f'Unsupported ARM64 Mach-O reloc type {r_type} at {pc:#x}')
+                raise RuntimeError(f'Unsupported reloc type {r_type} in {obj_path}')
 
-    assert len(code_blob) <= CODE_MAX, f'code_blob too large: {len(code_blob)} > {CODE_MAX}'
-
-    start_va = None
-    power_va = None
-    for i, sym in enumerate(syms):
-        if sym['name'] == '_gtel_usb_start':
-            start_va = sym_vas[i]
-        elif sym['name'] == '_gtel_pmic_power_action':
-            power_va = sym_vas[i]
-    assert start_va is not None, '_gtel_usb_start not found'
-    assert power_va is not None, '_gtel_pmic_power_action not found'
-
-    print(f'Relocated gtel_usb: code+rodata+GOT = {len(code_blob)} / {CODE_MAX} bytes')
-    print(f'                    BSS+common      = {bss_cur - BSS_BASE} / {BSS_MAX} bytes')
-    return bytes(code_blob), start_va, power_va, bss_cur - BSS_BASE
+    assert len(code_blob) <= code_max, f'code_blob overflow in {obj_path}: {len(code_blob)} > {code_max}'
+    return bytes(code_blob), sym_map, bss_cur - bss_base
 
 
 def patch_u32(data, foff, expect, repl, label):
@@ -388,46 +401,135 @@ def patch_u32(data, foff, expect, repl, label):
 
 
 def main():
-    if not os.path.exists(BAK):
-        shutil.copyfile(KERN, BAK)
-        print(f'Backed up {KERN} -> {BAK}')
     data = bytearray(open(BAK, 'rb').read())
 
-    obj_path = compile_gtel_usb()
-    code_blob, start_va, power_va, bss_sz = relocate_macho(obj_path)
+    # 1. Compile & relocate gtel_usb
+    usb_obj = compile_gtel_usb()
+    usb_blob, usb_syms, bss_sz = relocate_macho_file(usb_obj, CODE_BASE, CODE_MAX, BSS_BASE, BSS_MAX)
+    start_va = usb_syms['_gtel_usb_start']
+    power_va = usb_syms['_gtel_pmic_power_action']
+    print(f'Relocated gtel_usb: code={len(usb_blob)}/{CODE_MAX}, BSS={bss_sz}/{BSS_MAX}')
 
-    # 1. Overwrite unused sweet_usb slot (0xfffffff0074936b0 .. 0xfffffff007495410)
-    slot_foff = fo(CODE_BASE)
-    data[slot_foff:slot_foff + CODE_MAX] = b'\x00' * CODE_MAX
-    data[slot_foff:slot_foff + len(code_blob)] = code_blob
+    # 2. Compile & relocate gtel_display
+    disp_obj = compile_gtel_display()
+    disp_blob, disp_syms, _ = relocate_macho_file(disp_obj, DISP_CODE_BASE, DISP_CODE_MAX)
+    publish_va = disp_syms['_gtel_publish_display_modes']
+    handle_74_va = disp_syms['_gtel_handle_sel_74']
+    handle_79_va = disp_syms['_gtel_handle_sel_79']
+    appoint_va = disp_syms['_gtel_appoint_backboardd']
+    print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
-    # Zero unused _ud BSS region in __DATA? (__DATA.__bss may be zerofill or in file, check)
-    # _sweet_usb_probe is dead now, so zero the call site in _sweet_ufs_rootdev
-    patch_u32(data, fo(0xFFFFFFF00748C1DC), encode_bl(0xFFFFFFF00748C1DC, CODE_BASE, True), 0xD503201F, 'nop sweet_usb_probe')
+    # 3. Write USB slot
+    usb_foff = fo(CODE_BASE)
+    data[usb_foff:usb_foff + CODE_MAX] = b'\x00' * CODE_MAX
+    data[usb_foff:usb_foff + len(usb_blob)] = usb_blob
 
-    # 2. Hook _load_init_program (0xfffffff0077aa7c8 was bl _gtel_mmc_probe -> call _gtel_usb_start)
-    # Wait: preserve _gtel_mmc_probe?! No! The USB probe ALREADY ran? Let's call BOTH in a small trampoline in the cave?
-    # Wait: load_init_program calls:
-    #   0x77aa7c4: bl _sweet_sample_start
-    #   0x77aa7c8: bl _gtel_mmc_probe
-    # So replacing 0x77aa7c8 MUST STILL CALL _gtel_mmc_probe BEFORE _gtel_usb_start!
-    # Put a 20-byte trampoline right after code_blob (at CODE_BASE + len(code_blob) aligned to 4)
-    tramp_va = CODE_BASE + ((len(code_blob) + 3) & ~3)
-    assert (tramp_va + 20) <= CODE_BASE + CODE_MAX, 'No room for load_init_program trampoline'
+    # Trampoline for load_init_program in CODE_BASE
+    tramp_va = CODE_BASE + ((len(usb_blob) + 3) & ~3)
+    assert (tramp_va + 28) <= CODE_BASE + CODE_MAX, 'No room for trampoline'
     tramp = [
         0xA9BF7BFD,                         # stp x29, x30, [sp, #-0x10]!
         0x910003FD,                         # mov x29, sp
         encode_bl(tramp_va + 8,  0xFFFFFFF00748EA50, True),  # bl _gtel_mmc_probe
-        encode_bl(tramp_va + 12, start_va,           True),  # bl _gtel_usb_start
+        encode_bl(tramp_va + 12, appoint_va,         True),  # bl _gtel_appoint_backboardd
+        encode_bl(tramp_va + 16, start_va,           True),  # bl _gtel_usb_start
         0xA8C17BFD,                         # ldp x29, x30, [sp], #0x10
         0xD65F03C0,                         # ret
     ]
     for i, w in enumerate(tramp):
         struct.pack_into('<I', data, fo(tramp_va + 4 * i), w)
     patch_u32(data, fo(0xFFFFFFF0077AA7C8), encode_bl(0xFFFFFFF0077AA7C8, 0xFFFFFFF00748EA50, True),
-              encode_bl(0xFFFFFFF0077AA7C8, tramp_va, True), 'hook load_init_program -> mmc_probe + gtel_usb_start')
+              encode_bl(0xFFFFFFF0077AA7C8, tramp_va, True), 'hook load_init_program')
 
-    # 3. Patch _halt_all_cpus to use PM8916 PON + MPM2_MPM_PS_HOLD (fastboot on panic) with PSCI fallback
+    # Nop sweet_usb_probe
+    patch_u32(data, fo(0xFFFFFFF00748C1DC), encode_bl(0xFFFFFFF00748C1DC, CODE_BASE, True), 0xD503201F, 'nop sweet_usb_probe')
+
+    # 4. Write Display slot
+    disp_foff = fo(DISP_CODE_BASE)
+    disp_slot = bytearray(disp_blob)
+
+    # Hooks in DISP_CODE_BASE right after disp_blob
+    pad = (-len(disp_slot)) & 3
+    disp_slot.extend(b'\x00' * pad)
+
+    start_hook_va = DISP_CODE_BASE + len(disp_slot)
+    start_hook = [
+        0xA9BF7BFD,                         # stp x29, x30, [sp, #-0x10]!
+        0x910003FD,                         # mov x29, sp
+        0xAA1303E0,                         # mov x0, x19 (AppleCLCD *this)
+        encode_bl(start_hook_va + 12, publish_va, True), # bl gtel_publish_display_modes
+        0xA8C17BFD,                         # ldp x29, x30, [sp], #0x10
+        encode_bl(start_hook_va + 20, 0xFFFFFFF007A48374, False), # b 0xfffffff007a48374
+    ]
+    disp_slot.extend(struct.pack(f'<{len(start_hook)}I', *start_hook))
+
+    ext_hook_va = DISP_CODE_BASE + len(disp_slot)
+    # ext_hook structure:
+    # +0:  cmp w19, #74
+    # +4:  b.eq handle_74 (+24)
+    # +8:  cmp w19, #79
+    # +12: b.eq handle_79 (+44)
+    # +16: cmp w19, #73
+    # +20: b.eq handle_73 (+64)
+    # +24: b default_fallback (+88)
+    h_74_va = ext_hook_va + 28
+    h_79_va = ext_hook_va + 56
+    h_73_va = ext_hook_va + 84
+    h_def_va = ext_hook_va + 92
+
+    ext_hook = [
+        0x71012A7F,                         # cmp w19, #74
+        encode_b_cond(ext_hook_va + 4, h_74_va, 0), # b.eq h_74
+        0x71013E7F,                         # cmp w19, #79
+        encode_b_cond(ext_hook_va + 12, h_79_va, 0), # b.eq h_79
+        0x7101267F,                         # cmp w19, #73
+        encode_b_cond(ext_hook_va + 20, h_73_va, 0), # b.eq h_73
+        encode_bl(ext_hook_va + 24, h_def_va, False), # b h_def
+        # handle_74 (+28):
+        0xA9BF7BFD,                         # stp x29, x30, [sp, #-0x10]!
+        0x910003FD,                         # mov x29, sp
+        0xAA1403E0,                         # mov x0, x20 (args)
+        encode_bl(h_74_va + 12, handle_74_va, True), # bl gtel_handle_sel_74
+        0xA8C17BFD,                         # ldp x29, x30, [sp], #0x10
+        0x2A1F03F5,                         # mov w21, wzr
+        encode_bl(h_74_va + 24, 0xFFFFFFF007A49668, False), # b 0xfffffff007a49668 (skip bzero!)
+        # handle_79 (+56):
+        0xA9BF7BFD,                         # stp x29, x30, [sp, #-0x10]!
+        0x910003FD,                         # mov x29, sp
+        0xAA1403E0,                         # mov x0, x20 (args)
+        encode_bl(h_79_va + 12, handle_79_va, True), # bl gtel_handle_sel_79
+        0xA8C17BFD,                         # ldp x29, x30, [sp], #0x10
+        0x2A1F03F5,                         # mov w21, wzr
+        encode_bl(h_79_va + 24, 0xFFFFFFF007A49668, False), # b 0xfffffff007a49668
+        # handle_73 (+84):
+        0x2A1F03F5,                         # mov w21, wzr
+        encode_bl(h_73_va + 4, 0xFFFFFFF007A49668, False), # b 0xfffffff007a49668
+        # default fallback (+92):
+        # matches 0xfffffff007a4949c original logic:
+        # ldr w8, [x20, #0x50]; cmp w8, #1; b.ne 0x7a49608; b 0x7a4936c
+        # Note: b.ne cannot reach 0x7a49608 (19-bit limit +/-1MB), so use b.eq +8 followed by unconditional b
+        0xB9405288,                         # ldr w8, [x20, #0x50]
+        0x7100051F,                         # cmp w8, #1
+        encode_b_cond(h_def_va + 8, h_def_va + 16, 0), # b.eq +8 (skip to b 0x7a4936c)
+        encode_bl(h_def_va + 12, 0xFFFFFFF007A49608, False), # b 0xfffffff007a49608 (when ne)
+        encode_bl(h_def_va + 16, 0xFFFFFFF007A4936C, False), # b 0xfffffff007a4936c (when eq)
+    ]
+    disp_slot.extend(struct.pack(f'<{len(ext_hook)}I', *ext_hook))
+
+    assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
+    data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
+    data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
+    print(f'Wrote disp_slot: {len(disp_slot)} / {DISP_CODE_MAX} bytes')
+
+    # Hook AppleCLCD::start
+    patch_u32(data, fo(0xFFFFFFF007A484E0), 0x17FFFFA5,
+              encode_bl(0xFFFFFFF007A484E0, start_hook_va, False), 'hook AppleCLCD::start -> publish_modes')
+
+    # Hook AppleCLCD::externalMethod
+    patch_u32(data, fo(0xFFFFFFF007A4949C), 0xB9405288,
+              encode_bl(0xFFFFFFF007A4949C, ext_hook_va, False), 'hook AppleCLCD::externalMethod -> ext_hook')
+
+    # 5. Patch halt_all_cpus to use PM8916 PON + MPM2_MPM_PS_HOLD
     patch_u32(data, fo(0xFFFFFFF00742D870), 0x340000F4, 0x2A1403E0, 'halt_all_cpus mov w0, w20')
     patch_u32(data, fo(0xFFFFFFF00742D874), 0x52800120, 0x2A1403E1, 'halt_all_cpus mov w1, w20')
     patch_u32(data, fo(0xFFFFFFF00742D878), 0x52800034,
@@ -435,7 +537,7 @@ def main():
     patch_u32(data, fo(0xFFFFFFF00742D87C), 0x72B08000, 0x34000094, 'halt_all_cpus cbz w20, halt')
     patch_u32(data, fo(0xFFFFFFF00742D888), 0xD4000003, 0xD503201F, 'halt_all_cpus nop old smc')
 
-    # 4. Patch 0108 iOS 12.5.7 IOMobileFramebuffer SwapEnd struct (0x278) & offsets in AppleCLCD::present + externalMethod
+    # 6. Patch 0108 iOS 12.5.7 IOMobileFramebuffer SwapEnd struct (0x278) & offsets
     patch_u32(data, 0xA44898, 0xB9410429, 0xB940C829, 'present mask +0xc8')
     patch_u32(data, 0xA448E8, 0x91019268, 0x91014268, 'present rect_a +0x50')
     patch_u32(data, 0xA448F8, 0x91031268, 0x91026268, 'present rect_b +0x98')

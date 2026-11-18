@@ -1,0 +1,258 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 60b9224..60f1a77 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1461,6 +1461,84 @@ static const unsigned char sweet_dyld_sig[16] = {
+ 	0xe9, 0x03, 0x00, 0x32, 0x09, 0x05, 0x01, 0x39,
+ };
+ 
++/*
++ * Manually appoint backboardd main display driver by patching 0x1e920
++ * from 0xaa0003e2 (mov x2, x0) to 0x52800022 (mov w2, #1) so that
++ * [server displayWithDisplayId:1] is called directly.
++ */
++#define GTEL_BACKBOARDD_PATH "/usr/libexec/backboardd"
++#define GTEL_BACKBOARDD_OFF  0x1e920
++
++static void
++gtel_appoint_backboardd(void)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	mount_t mp = rootvnode ? rootvnode->v_mount : NULL;
++	uint64_t saved_flags = 0;
++	uint32_t cur = 0;
++	uint32_t patched = 0x52800022; /* mov w2, #1 */
++	int resid = 0;
++	int error = 0;
++	int err = 0;
++
++	error = vnode_open(GTEL_BACKBOARDD_PATH, FREAD, 0, 0, &vp, ctx);
++	if (error != 0) {
++		printf("SWEET: cannot open %s (errno %d)\n", GTEL_BACKBOARDD_PATH, error);
++		return;
++	}
++
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)&cur, 4,
++	    GTEL_BACKBOARDD_OFF, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	if (err != 0 || resid != 0) {
++		printf("SWEET: cannot read %s (errno %d)\n", GTEL_BACKBOARDD_PATH, err);
++		return;
++	}
++
++	if (cur == patched) {
++		printf("SWEET: backboardd display driver already appointed\n");
++		return;
++	}
++	if (cur != 0xaa0003e2) {
++		printf("SWEET: backboardd at 0x%x has unexpected opcode 0x%08x\n",
++		    GTEL_BACKBOARDD_OFF, cur);
++		return;
++	}
++
++	if (mp && (mp->mnt_flag & MNT_RDONLY)) {
++		saved_flags = mp->mnt_flag;
++		mp->mnt_flag &= ~MNT_RDONLY;
++	}
++
++	vp = NULLVP;
++	error = vnode_open(GTEL_BACKBOARDD_PATH, (FREAD | FWRITE), 0, 0, &vp, ctx);
++	if (error != 0) {
++		printf("SWEET: cannot open %s for write (errno %d)\n", GTEL_BACKBOARDD_PATH, error);
++		goto out;
++	}
++
++	resid = 0;
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&patched, 4,
++	    GTEL_BACKBOARDD_OFF, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	vnode_close(vp, FWRITE, ctx);
++
++	if (err == 0 && resid == 0) {
++		printf("SWEET: backboardd display driver appointed (mov w2, #1 at 0x%x)\n",
++		    GTEL_BACKBOARDD_OFF);
++	} else {
++		printf("SWEET: backboardd display appointment failed (errno %d)\n", err);
++	}
++
++out:
++	if (mp && saved_flags) {
++		mp->mnt_flag = saved_flags;
++	}
++}
++
+ static void
+ sweet_revert_dyld_bind_at_load(void)
+ {
+@@ -1567,6 +1645,7 @@ bsdinit_task(void)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_inject_gestalt_cache();
+ 	sweet_revert_dyld_bind_at_load();
++	gtel_appoint_backboardd();
+ #endif
+ 
+ 	load_init_program(p);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 61b3ec7..8198a6a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -205,6 +205,115 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	setProperty("primary-display", true);
+ 	setProperty("display-type", 1ULL, 32);
++
++	/* IOMFBDisplayRefresh */
++	OSDictionary *refresh = OSDictionary::withCapacity(4);
++	if (refresh != NULL) {
++		uint64_t interval = (1ULL << 32) / 60ULL; /* 71582788ULL */
++		uint64_t ticks = 320000ULL; /* 19.2 MHz / 60 */
++		OSNumber *n1 = OSNumber::withNumber(interval, 64);
++		OSNumber *n2 = OSNumber::withNumber(interval, 64);
++		OSNumber *n3 = OSNumber::withNumber(interval, 64);
++		OSNumber *n4 = OSNumber::withNumber(ticks, 64);
++		refresh->setObject("displayMinRefreshInterval", n1);
++		refresh->setObject("displayMaxRefreshInterval", n2);
++		refresh->setObject("displayRefreshStep", n3);
++		refresh->setObject("displayRefreshStepMachTime", n4);
++		setProperty("IOMFBDisplayRefresh", refresh);
++		refresh->release();
++		if (n1) n1->release();
++		if (n2) n2->release();
++		if (n3) n3->release();
++		if (n4) n4->release();
++	}
++
++	/* ColorElements */
++	OSArray *colors = OSArray::withCapacity(1);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	if (colors != NULL && color != NULL) {
++		OSNumber *c_id = OSNumber::withNumber(1ULL, 32);
++		OSNumber *c_enc = OSNumber::withNumber(0ULL, 32);
++		OSNumber *c_depth = OSNumber::withNumber(8ULL, 32);
++		OSNumber *c_col = OSNumber::withNumber(1ULL, 32);
++		OSNumber *c_eotf = OSNumber::withNumber(1ULL, 32);
++		OSNumber *c_dr = OSNumber::withNumber(0ULL, 32);
++		OSNumber *c_sc = OSNumber::withNumber(1ULL, 32);
++		color->setObject("ID", c_id);
++		color->setObject("PixelEncoding", c_enc);
++		color->setObject("Depth", c_depth);
++		color->setObject("Colorimetry", c_col);
++		color->setObject("EOTF", c_eotf);
++		color->setObject("DynamicRange", c_dr);
++		color->setObject("Score", c_sc);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		if (c_id) c_id->release();
++		if (c_enc) c_enc->release();
++		if (c_depth) c_depth->release();
++		if (c_col) c_col->release();
++		if (c_eotf) c_eotf->release();
++		if (c_dr) c_dr->release();
++		if (c_sc) c_sc->release();
++	}
++
++	/* TimingElements */
++	OSArray *timings = OSArray::withCapacity(1);
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horiz = OSDictionary::withCapacity(4);
++	OSDictionary *vert = OSDictionary::withCapacity(4);
++	if (timings != NULL && timing != NULL && horiz != NULL && vert != NULL && colors != NULL) {
++		uint32_t rate = 60 << 16;
++		OSNumber *h_act = OSNumber::withNumber((uint64_t)fWidth, 32);
++		OSNumber *h_tot = OSNumber::withNumber((uint64_t)fWidth, 32);
++		OSNumber *h_rate = OSNumber::withNumber((uint64_t)rate, 32);
++		OSNumber *h_prate = OSNumber::withNumber((uint64_t)rate, 32);
++		horiz->setObject("Active", h_act);
++		horiz->setObject("Total", h_tot);
++		horiz->setObject("SyncRate", h_rate);
++		horiz->setObject("PreciseSyncRate", h_prate);
++
++		OSNumber *v_act = OSNumber::withNumber((uint64_t)fHeight, 32);
++		OSNumber *v_tot = OSNumber::withNumber((uint64_t)fHeight, 32);
++		OSNumber *v_rate = OSNumber::withNumber((uint64_t)rate, 32);
++		OSNumber *v_prate = OSNumber::withNumber((uint64_t)rate, 32);
++		vert->setObject("Active", v_act);
++		vert->setObject("Total", v_tot);
++		vert->setObject("SyncRate", v_rate);
++		vert->setObject("PreciseSyncRate", v_prate);
++
++		OSNumber *t_id = OSNumber::withNumber(1ULL, 32);
++		OSNumber *t_sc = OSNumber::withNumber(1ULL, 32);
++		timing->setObject("ID", t_id);
++		timing->setObject("Score", t_sc);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horiz);
++		timing->setObject("VerticalAttributes", vert);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++
++		if (h_act) h_act->release();
++		if (h_tot) h_tot->release();
++		if (h_rate) h_rate->release();
++		if (h_prate) h_prate->release();
++		if (v_act) v_act->release();
++		if (v_tot) v_tot->release();
++		if (v_rate) v_rate->release();
++		if (v_prate) v_prate->release();
++		if (t_id) t_id->release();
++		if (t_sc) t_sc->release();
++	}
++	if (horiz) horiz->release();
++	if (vert) vert->release();
++	if (timing) timing->release();
++	if (timings) timings->release();
++	if (color) color->release();
++	if (colors) colors->release();
++
++	setProperty("backlight-control", true);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -581,6 +690,30 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
++	case 74: /* kSweetFBSupportedFrameInfo */
++		if (args->scalarOutput && args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = 1;
++			args->scalarOutputCount = 1;
++		}
++		if (args->structureOutput && args->structureOutputSize >= 64) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			uint32_t *fi = (uint32_t *)args->structureOutput;
++			fi[0] = fFB->fWidth;
++			fi[1] = fFB->fHeight;
++			fi[2] = fFB->fRowBytes;
++			fi[3] = 60;
++		}
++		break;
++	case 79: /* kSweetFBGetBlock */
++		if (args->structureOutput && args->structureOutputSize >= 12 &&
++		    args->scalarInput && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			uint32_t ids[2] = { 1, 1 }; /* ColorID=1, TimingID=1 */
++			memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++		}
++		break;
++	case 73: /* kSweetFBChangeFrameInfo */
++		break;
+ 	case kSweetFBSwapWait:
+ 	default:
+ 		if (args->scalarOutputCount == 1) {
+@@ -593,7 +726,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+ 	}
+-	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL &&
++	    selector != 74 && selector != 79) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {

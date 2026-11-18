@@ -146,6 +146,7 @@ def build(target='ipad'):
             ('compatible', cstr('gtel,display') + cstr('sweet,display')),
             ('canvas-width', u32(FB_W)),
             ('canvas-height', u32(FB_H)),
+            ('backlight-control', u32(1)),
         ])
     ])
 
