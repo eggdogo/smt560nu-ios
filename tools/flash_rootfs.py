@@ -8,9 +8,9 @@ image is cut into pieces: each piece is a sparse image covering the whole
 partition with DONT_CARE everywhere except its own RAW chunks, and all-zero
 4 KiB blocks are skipped outright (an HFS image is mostly empty space).
 
-The raw image is read from stdin, so a compressed one can be streamed:
-  wsl zstd -dc gtelroot.img.zst | python tools/flash_rootfs.py - userdata
-Usage: python tools/flash_rootfs.py <image|-> <partition> [--dry-run]
+A .zst image is decompressed on the fly (Python 3.14 compression.zstd), and
+'-' reads the raw image from stdin.
+Usage: python tools/flash_rootfs.py <image[.zst]|-> <partition> [--dry-run]
 """
 import argparse, struct, sys, time, os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -41,9 +41,15 @@ def sparse(total_blocks, runs):
 
 
 def pieces(stream, total_blocks):
-    """Yield (runs, payload bytes) per transfer; zero blocks are dropped."""
+    """Yield (runs, payload bytes) per transfer.
+
+    Only unallocated all-zero blocks are omitted (CHUNK_DONT_CARE). Allocated
+    all-zero blocks in an HFS+ filesystem (e.g. dyld_shared_cache BSS pages)
+    are written explicitly as zeros so stale eMMC data cannot corrupt them.
+    """
     runs, size, blk = [], 0, 0
     cur_start, cur = None, bytearray()
+    hfs_alloc_sz, hfs_alloc_ranges, alloc_bmap = 0, [], bytearray()
     while True:
         b = stream.read(BLK)
         if not b:
@@ -52,7 +58,25 @@ def pieces(stream, total_blocks):
             b = b + bytes(BLK - len(b))
         if blk >= total_blocks:
             raise SystemExit(f'image is larger than the partition ({total_blocks} blocks)')
-        if b == ZERO:
+        if blk == 0:
+            sig = b[0x400:0x402]
+            if sig in (b'H+', b'HX') and struct.unpack_from('>I', b, 0x428)[0] == BLK:
+                hfs_alloc_sz = struct.unpack_from('>Q', b, 0x470)[0]
+                for i in range(8):
+                    sb, bc = struct.unpack_from('>II', b, 0x480 + i * 8)
+                    if bc:
+                        hfs_alloc_ranges.append((sb, sb + bc))
+        elif hfs_alloc_ranges:
+            for sb, eb in hfs_alloc_ranges:
+                if sb <= blk < eb:
+                    alloc_bmap += b
+                    break
+        if len(alloc_bmap) >= hfs_alloc_sz and hfs_alloc_sz > 0:
+            byte_i = blk >> 3
+            is_allocated = byte_i < hfs_alloc_sz and bool(alloc_bmap[byte_i] & (1 << (7 - (blk & 7))))
+        else:
+            is_allocated = True
+        if b == ZERO and (not hfs_alloc_sz or not is_allocated):
             if cur:
                 runs.append((cur_start, bytes(cur))); cur = bytearray()
         else:
@@ -103,7 +127,13 @@ def main():
     total_blocks = size // BLK
     print(f'{a.partition}: {size >> 20} MiB')
 
-    stream = sys.stdin.buffer if a.image == '-' else open(a.image, 'rb')
+    if a.image == '-':
+        stream = sys.stdin.buffer
+    elif a.image.endswith('.zst'):
+        from compression import zstd       # Python 3.14+
+        stream = zstd.open(a.image, 'rb')
+    else:
+        stream = open(a.image, 'rb')
     t0, sent = time.time(), 0
     for n, (runs, data) in enumerate(pieces(stream, total_blocks)):
         img = sparse(total_blocks, runs)

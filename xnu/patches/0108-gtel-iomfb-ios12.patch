@@ -1,0 +1,127 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_SWAP_REC_SIZE_IOS12    0x278
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -112,6 +113,7 @@
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint32_t      fPendingSize;
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+@@ -120,8 +122,8 @@
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+-	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	void swap(const uint8_t *rec, uint32_t rec_size);
++	void present(const uint8_t *rec, uint32_t rec_size);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -256,16 +258,18 @@
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	uint32_t rec_size = 0;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
++			rec_size = fb->fPendingSize;
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		fb->present(rec, rec_size);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -309,10 +313,11 @@
+  * default 10 Hz).
+  */
+ void
+-AppleCLCD::swap(const uint8_t *rec)
++AppleCLCD::swap(const uint8_t *rec, uint32_t rec_size)
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingSize = rec_size;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -321,9 +326,12 @@
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::present(const uint8_t *rec, uint32_t rec_size)
+ {
+-	uint32_t mask = get32(rec, 0x104);
++	bool ios12 = rec_size < SWEET_FB_SWAP_REC_SIZE;
++	uint32_t swap_id = get32(rec, ios12 ? 0x40 : 0x50);
++	uint32_t mask = get32(rec, ios12 ? 0xc8 : 0x104);
++	uint32_t max_layers = ios12 ? 3 : SWEET_FB_LAYERS;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -336,22 +344,23 @@
+ 		}
+ 	}
+ 
+-	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		uint32_t id = get32(rec, 0x54 + 4 * layer);
+-		const uint8_t *a = rec + 0x64 + 16 * layer;
+-		const uint8_t *b = rec + 0xc4 + 16 * layer;
++	for (uint32_t layer = 0; layer < max_layers; layer++) {
++		uint32_t id = get32(rec, (ios12 ? 0x44 : 0x54) + 4 * layer);
++		const uint8_t *a = rec + (ios12 ? 0x50 : 0x64) + 16 * layer;
++		const uint8_t *b = rec + (ios12 ? 0x98 : 0xc4) + 16 * layer;
+ 		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+ 		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+ 		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		bool enabled = (mask & (1u << layer)) != 0 || (ios12 && get32(rec, 0x80 + 4 * layer) != 0);
+ 
+-		if (!(mask & (1u << layer)) || id == 0) {
++		if (!enabled || id == 0) {
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
++			    swap_id, layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+@@ -518,12 +527,15 @@
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+ 		if (args->structureInputDescriptor != NULL ||
+-		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
++		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE_IOS12) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
+-		fFB->swap(rec);
++		bzero(rec, sizeof(rec));
++		uint32_t copy_len = args->structureInputSize < sizeof(rec)
++		    ? (uint32_t)args->structureInputSize : (uint32_t)sizeof(rec);
++		memcpy(rec, args->structureInput, copy_len);
++		fFB->swap(rec, copy_len);
+ 		break;
+ 	}
+ 	case kSweetFBGetID:
