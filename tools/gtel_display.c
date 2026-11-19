@@ -237,6 +237,28 @@ static void gtel_dump_words(const char *tag, const uint8_t *buf, uint32_t from, 
     }
 }
 
+extern void *current_proc(void);
+extern int cs_entitlements_blob_get(void *proc, void **blob, size_t *len);
+static void gtel_ent_probe(const char *name) {
+    void *blob = 0;
+    size_t len = 0;
+    int r = cs_entitlements_blob_get(current_proc(), &blob, &len);
+    const unsigned char *b = (const unsigned char *)blob;
+    printf("ENTPROBE %s: rc %d len %d blob %p first %02x%02x%02x%02x %02x%02x%02x%02x\n", name, r, (int)len, blob,
+           b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0);
+    static const char key[] = "com.apple.backboard.client";
+    for (int i = 0; b && i + 120 < (int)len; i++) {
+        int j = 0;
+        while (key[j] && b[i + j] == (unsigned char)key[j]) j++;
+        if (!key[j]) {
+            char tail[64];
+            for (int k = 0; k < 60; k++) { unsigned char c = b[i + 26 + k]; tail[k] = (c >= 32 && c < 127) ? c : '.'; }
+            tail[60] = 0;
+            printf("ENTPROBE %s: found backboard.client at %d: %s\n", name, i, tail);
+        }
+    }
+}
+
 /* returns 1 if the trap's return value should be printed */
 static int gtel_msg_trace(const uint64_t *args) {
     char name[24];
@@ -248,6 +270,12 @@ static int gtel_msg_trace(const uint64_t *args) {
     name[0] = 0;
     proc_selfname(name, sizeof(name));
     int is_ui = gtel_streq(name, "backboardd") || gtel_streq(name, "SpringBoard");
+    if (is_ui && gtel_streq(name, "SpringBoard")) {
+        volatile uint32_t *pc = (volatile uint32_t *)0xfffffff00803b18cULL;
+        uint32_t n = *pc + 1;
+        *pc = n;
+        if (n == 1 || n == 100 || n == 400 || n == 1500) { printf("ENTPROBE send #%u\n", n); gtel_ent_probe(name); }
+    }
     /* launchd: only the few replies right after a UI process asked about CARenderServer
      * (counter in the gtel_usb BSS slack, 0xfffffff00803b180: writable, unused by usb) */
     volatile uint32_t *watch = (volatile uint32_t *)0xfffffff00803b180ULL;
@@ -308,4 +336,100 @@ void gtel_handle_sel_79(struct IOExternalMethodArguments *args) {
             memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
         }
     }
+}
+
+
+/* read back the injected MobileGestalt cache (head/tail) and report zero-filled content */
+extern int vnode_open(const char *path, int fmode, int cmode, int flags, void **vpp, void *ctx);
+extern int vnode_close(void *vp, int flags, void *ctx);
+extern int vn_rdwr(int rw, void *vp, char *base, int len, long long off, int seg, int ioflag, void *cred, int *aresid, void *p);
+extern void *vfs_context_kernel(void);
+extern void *vfs_context_ucred(void *ctx);
+extern void *vfs_context_proc(void *ctx);
+static void gtel_peek(const char *path) {
+    unsigned char buf[32];
+    void *vp = 0;
+    void *ctx = vfs_context_kernel();
+    int e = vnode_open(path, 1, 0, 0, &vp, ctx);
+    if (e) { printf("PEEK %s: open err %d\n", path, e); return; }
+    int resid = 0;
+    for (int i = 0; i < 32; i++) buf[i] = 0xEE;
+    int r = vn_rdwr(0, vp, (char *)buf, 32, 0, 2, 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+    printf("PEEK %s: rc %d read %d first %02x%02x%02x%02x%02x%02x%02x%02x\n", path, r, 32 - resid,
+           buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    vnode_close(vp, 1, ctx);
+}
+static void gtel_mgcheck(const char *tag) {
+    unsigned char buf[512];
+    void *vp = 0;
+    void *ctx = vfs_context_kernel();
+    int e = vnode_open("/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
+                       1, 0, 0, &vp, ctx);
+    if (e) { printf("MGCHK %s: open err %d\n", tag, e); return; }
+    long long offs[6] = {0, 2048, 3900, 0, 2048, 3900};
+    for (int k = 0; k < 6; k++) {
+        int resid = 0, zeros = 0;
+        for (int i = 0; i < 512; i++) buf[i] = 0xEE;
+        int r = vn_rdwr(0, vp, (char *)buf, 512, offs[k], 2, k >= 3 ? 0x0808 : 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+        for (int i = 0; i < 512 - resid && i < 512; i++) if (buf[i] == 0) zeros++;
+        printf("MGCHK %s: off %d rc %d resid %d zeros %d first %02x%02x%02x%02x%02x%02x%02x%02x\n", tag, (int)offs[k], r, resid, zeros,
+               buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    }
+    vnode_close(vp, 1, ctx);
+}
+
+/* proc_exit() hook: log how interesting processes leave (exit code / terminating signal) */
+extern int proc_pid(void *p);
+extern void proc_name(int pid, char *buf, int size);
+void gtel_exit_log(uint64_t p) {
+    char name[24];
+    name[0] = 0;
+    int pid = proc_pid((void *)p);
+    proc_name(pid, name, sizeof(name));
+    uint32_t x = *(volatile uint16_t *)(p + 0x480);
+    if (gtel_streq(name, "SpringBoard") || gtel_streq(name, "backboardd") || gtel_streq(name, "profiled") ||
+        gtel_streq(name, "accountsd") || (x != 0 && x != 0x100)) {
+        if (gtel_streq(name, "backboardd")) {
+            volatile uint32_t *c = (volatile uint32_t *)0xfffffff00803b188ULL;
+            if (*c < 3) { *c = *c + 1; gtel_mgcheck("backboardd-exit"); gtel_peek("/private/var/mobile/Library/Caches/com.apple.MobileGestalt.plist"); gtel_peek("/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist"); gtel_peek("/private/var/mobile/Library/Preferences/com.apple.springboard.plist"); gtel_peek("/private/var/mobile/Library/Preferences/com.apple.backboardd.plist"); }
+        }
+        printf("EXIT %s[%d] xstat 0x%x (exit code %u, signal %u)\n", name, pid, x, (x >> 8) & 0xff, x & 0x7f);
+    }
+}
+
+/* psignal_internal() hook: who kills SpringBoard & friends? */
+extern int proc_selfpid(void);
+extern void proc_selfname(char *buf, int size);
+void gtel_sig_log(uint64_t p, uint64_t sig) {
+    if (sig == 0) return;
+    char tn[24], sn[24];
+    tn[0] = 0; sn[0] = 0;
+    int tpid = proc_pid((void *)p);
+    proc_name(tpid, tn, sizeof(tn));
+    if (!(gtel_streq(tn, "SpringBoard") || gtel_streq(tn, "backboardd") || gtel_streq(tn, "profiled") || gtel_streq(tn, "accountsd") || sig == 9)) return;
+    proc_selfname(sn, sizeof(sn));
+    printf("SIGKILL? %s[%d] gets signal %d from %s[%d]\n", tn, tpid, (int)sig, sn, proc_selfpid());
+}
+
+/* csops_internal() hook: what do entitlement queries look like? */
+extern int proc_pidversion(void *p);
+extern uint32_t proc_getcsflags(void *p);
+extern int copyin(uint64_t uaddr, void *kaddr, size_t len);
+void gtel_csops_log(int pid, int ops, uint64_t uaddr, uint64_t usize, uint64_t utok) {
+    if (ops != 7) return;
+    char sn[24];
+    sn[0] = 0;
+    proc_selfname(sn, sizeof(sn));
+    if (!gtel_streq(sn, "SpringBoard")) return;
+    uint32_t tok[8];
+    for (int i = 0; i < 8; i++) tok[i] = 0xdeadbeef;
+    int ce = utok ? copyin(utok, tok, 32) : -1;
+    volatile uint32_t *c = (volatile uint32_t *)0xfffffff00803b190ULL;
+    if (*c > 40) return;
+    *c = *c + 1;
+    printf("CSOPS %s pid %d ops %d usize %d tokcopy %d tok pid %u ver %u cur pid %d ver %d\n", sn, pid, ops, (int)usize, ce, tok[5], tok[7],
+           proc_selfpid(), proc_pidversion(current_proc()));
+    void *eb = 0; size_t el = 0;
+    int er = cs_entitlements_blob_get(current_proc(), &eb, &el);
+    printf("CSOPS csflags 0x%x blob_get rc %d len %d ptr %p\n", (unsigned)proc_getcsflags(current_proc()), er, (int)el, eb);
 }

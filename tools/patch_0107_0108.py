@@ -46,6 +46,22 @@ EXT_SYMS = {
     '_ml_io_map':                 0xFFFFFFF00742E610,
     '_pmap_find_phys':            0xFFFFFFF007409B80,
     '_printf':                    0xFFFFFFF0072CD260,
+    '_vnode_open':                0xFFFFFFF0074C1660,
+    '_vnode_close':               0xFFFFFFF0074C1740,
+    '_vn_rdwr':                   0xFFFFFFF0074E2760,
+    '_vfs_context_kernel':        0xFFFFFFF0074E9BA0,
+    '_vfs_context_ucred':         0xFFFFFFF0074E9C20,
+    '_vfs_context_proc':          0xFFFFFFF0074E9800,
+    '_sync_internal':             0xFFFFFFF0074CBA80,
+    '_proc_selfpid':              0xFFFFFFF0077BBA00,
+    '_proc_selfname':             0xFFFFFFF0077BC1E0,
+    '_current_proc':              0xFFFFFFF007918480,
+    '_cs_entitlements_blob_get':  0xFFFFFFF007735340,
+    '_proc_pidversion':           0xFFFFFFF0077BAA50,
+    '_copyin':                    0xFFFFFFF007418F30,
+    '_proc_getcsflags':           0xFFFFFFF0077BBAB0,
+    '_proc_pid':                  0xFFFFFFF0077BA9F0,
+    '_proc_name':                 0xFFFFFFF0077BBF90,
     '_snprintf':                  0xFFFFFFF0077EF960,
     '_strcmp':                    0xFFFFFFF0073E6430,
     '_strlen':                    0xFFFFFFF0074308C0,
@@ -431,6 +447,9 @@ def main():
     handle_74_va = disp_syms['_gtel_handle_sel_74']
     handle_79_va = disp_syms['_gtel_handle_sel_79']
     sandbox_op2_va = disp_syms['_gtel_sandbox_op2']
+    exit_log_va = disp_syms['_gtel_exit_log']
+    sig_log_va = disp_syms['_gtel_sig_log']
+    csops_log_va = disp_syms['_gtel_csops_log']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -549,6 +568,41 @@ def main():
     ]
     disp_slot.extend(struct.pack(f'<{len(sbx_tramp)}I', *sbx_tramp))
 
+    # proc_exit() entry: log how SpringBoard/backboardd/... exit
+    ex_va = DISP_CODE_BASE + len(disp_slot)
+    ex_tramp = [
+        0xA9BE7BFD,                                              # stp x29, x30, [sp, #-0x20]!
+        0xA9017FE0,                                              # stp x0, xzr, [sp, #0x10]
+        0x910003FD,                                              # mov x29, sp
+        encode_bl(ex_va + 12, exit_log_va, True),                # bl gtel_exit_log (x0 = proc)
+        0xA9417FE0,                                              # ldp x0, xzr, [sp, #0x10]
+        0xA8C27BFD,                                              # ldp x29, x30, [sp], #0x20
+        0xD10243FF,                                              # orig: sub sp, sp, #0x90 (displaced)
+        encode_bl(ex_va + 28, 0xFFFFFFF0077B0714, False),        # b proc_exit+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(ex_tramp)}I', *ex_tramp))
+
+    sg_va = DISP_CODE_BASE + len(disp_slot)
+    sg_tramp = [
+        0xA9BA7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        0xAA0403E1,                                              # mov x1, x4 (signum)
+        encode_bl(sg_va + 24, sig_log_va, True),                 # bl gtel_sig_log
+        0xA94107E0, 0xA9420FE2, 0xA94317E4, 0xA8C67BFD,
+        0xD102C3FF,                                              # orig: sub sp, sp, #0xb0
+        encode_bl(sg_va + 48, 0xFFFFFFF0077CA5A4, False),        # b psignal_internal+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(sg_tramp)}I', *sg_tramp))
+
+    cs_va = DISP_CODE_BASE + len(disp_slot)
+    cs_tramp = [
+        0xA9BA7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        encode_bl(cs_va + 20, csops_log_va, True),               # bl gtel_csops_log (args untouched)
+        0xA94107E0, 0xA9420FE2, 0xA94317E4, 0xA8C67BFD,
+        0xD10383FF,                                              # orig: sub sp, sp, #0xe0
+        encode_bl(cs_va + 44, 0xFFFFFFF0077BF5F4, False),        # b csops_internal+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(cs_tramp)}I', *cs_tramp))
+
     assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
     data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
     data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
@@ -561,6 +615,18 @@ def main():
     # Sandbox stand-in entry -> op 2 writes "allow" into libsandbox's result slot
     patch_u32(data, fo(0xFFFFFFF007735A30), 0xD10183FF,
               encode_bl(0xFFFFFFF007735A30, sbx_va, False), 'hook _sweet_sandbox_syscall entry (op 2 allow)')
+
+    patch_u32(data, fo(0xFFFFFFF0077B0710), 0xD10243FF,
+              encode_bl(0xFFFFFFF0077B0710, ex_va, False), 'hook proc_exit entry (EXIT log)')
+
+    # csops: entitlement/blob queries fail with EINVAL once CS_VALID was dropped ("remove VALID" pages): accept unsigned-valid procs
+    for va, exp in ((0xFFFFFFF0077BF888, 0x54002D80), (0xFFFFFFF0077BFA5C, 0x54001EE0), (0xFFFFFFF0077BFC14, 0x54001120)):
+        patch_u32(data, fo(va), exp, 0xD503201F, f'csops: ignore missing CS_VALID @{va:#x}')
+    patch_u32(data, fo(0xFFFFFFF0077BF73C), 0x540001C1, 0xD503201F, 'csops audit token: ignore pidversion mismatch')
+    patch_u32(data, fo(0xFFFFFFF0077BF5F0), 0xD10383FF,
+              encode_bl(0xFFFFFFF0077BF5F0, cs_va, False), 'hook csops_internal entry (CSOPS log)')
+    patch_u32(data, fo(0xFFFFFFF0077CA5A0), 0xD102C3FF,
+              encode_bl(0xFFFFFFF0077CA5A0, sg_va, False), 'hook psignal_internal entry (SIG log)')
 
     # Debug: let the crash heap-string scan (patch 0051) also run for SIGTRAP (sig 5): uncaught C++/ObjC
     # exceptions in daemons die with std::terminate -> brk, and the exception text is what we need.

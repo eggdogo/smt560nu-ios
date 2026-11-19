@@ -1,5 +1,6 @@
 import plistlib,struct,sys
-src='kernel.development.sweet.pre_variant'
+import os
+src=os.environ.get('SRC','kernel.development.sweet.pre_variant')
 k=bytearray(open(src,'rb').read())
 o=0x1fc60;OLD=4844
 p=plistlib.loads(bytes(k[o:o+OLD]))

@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..c68e5ce
 --- /dev/null
 +++ b/bsd/dev/gtel_usb.c
-@@ -0,0 +1,1226 @@
+@@ -0,0 +1,1230 @@
 +/*
 + * gtel MSM8916 ChipIdea HS-USB fastboot gadget + poweroff/reboot.
 + *
@@ -491,9 +491,12 @@ index 0000000..c68e5ce
 +	}
 +}
 +
++extern int sync_internal(void);
+
 +static __attribute__((noreturn)) void
 +gtel_do_poweroff(void)
 +{
++	(void)sync_internal();         /* flush HFS (no journal): an abrupt reset loses bitmap/catalog updates */
 +	gtel_usb_sleep_ms(50);
 +	gtel_usb_stop_hw();
 +	gtel_usb_sleep_ms(10);
@@ -506,6 +509,7 @@ index 0000000..c68e5ce
 +static __attribute__((noreturn)) void
 +gtel_do_reboot(bool bootloader)
 +{
++	(void)sync_internal();
 +	gtel_usb_sleep_ms(50);
 +	gtel_usb_stop_hw();
 +	gtel_usb_sleep_ms(10);
