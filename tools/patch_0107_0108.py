@@ -64,7 +64,29 @@ EXT_SYMS = {
     '_IORegistryEntry_setPropertyBool': 0xFFFFFFF0079846B0,
     '_OSObject_release':                0xFFFFFFF00791C060,
     '_bzero':                           0xFFFFFFF007B1F500,  # was 0x7B1F580 (= _memset): bzero(buf,n) ran memset(buf,n,garbage)
+    # Mach message trace
+    '_copyin':                          0xFFFFFFF007418F30,
+    '_copyout':                         0xFFFFFFF007419400,
+    '_proc_selfname':                   0xFFFFFFF0077BC1E0,
+    '_mach_msg_trap':                   0xFFFFFFF007295160,
+    '_mach_msg_overwrite_trap':         0xFFFFFFF007294B70,
 }
+
+MACH_TRAP_TABLE = 0xFFFFFFF0071712B8   # struct mach_trap is 32 bytes; function pointer at +8
+
+
+def seg_fo(data, va):
+    """File offset of a VA in any segment of the kernel Mach-O."""
+    ncmds = struct.unpack_from('<I', data, 16)[0]
+    off = 32
+    for _ in range(ncmds):
+        cmd, sz = struct.unpack_from('<II', data, off)
+        if cmd == 0x19:
+            vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', data, off + 24)
+            if vmaddr <= va < vmaddr + filesize:
+                return fileoff + (va - vmaddr)
+        off += sz
+    raise RuntimeError(f'VA {va:#x} not in any segment')
 
 DARWIN_HDR = r'''
 typedef unsigned char uint8_t;
@@ -408,6 +430,7 @@ def main():
     publish_va = disp_syms['_gtel_publish_display_modes']
     handle_74_va = disp_syms['_gtel_handle_sel_74']
     handle_79_va = disp_syms['_gtel_handle_sel_79']
+    sandbox_op2_va = disp_syms['_gtel_sandbox_op2']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -507,6 +530,25 @@ def main():
     ]
     disp_slot.extend(struct.pack(f'<{len(ext_hook)}I', *ext_hook))
 
+    # Sandbox stand-in (_sweet_sandbox_syscall @ 0xfffffff007735a30), op 2 = sandbox_check*:
+    # libsystem_sandbox returns (*args[0] != 0) where args[0] points at an uninitialised stack slot
+    # the real kext fills in. Hook the function entry: for call == 2 write 0 (allow) there.
+    sbx_va = DISP_CODE_BASE + len(disp_slot)
+    sbx_tramp = [
+        0x7100083F,                                              # cmp w1, #2
+        encode_b_cond(sbx_va + 4, sbx_va + 36, 1),               # b.ne orig
+        0xA9BE7BFD,                                              # stp x29, x30, [sp, #-0x20]!
+        0x910003FD,                                              # mov x29, sp
+        0xAA0203E0,                                              # mov x0, x2 (user arg)
+        encode_bl(sbx_va + 20, sandbox_op2_va, True),            # bl gtel_sandbox_op2
+        0x2A1F03E0,                                              # mov w0, wzr
+        0xA8C27BFD,                                              # ldp x29, x30, [sp], #0x20
+        0xD65F03C0,                                              # ret
+        0xD10183FF,                                              # orig: sub sp, sp, #0x60 (displaced)
+        encode_bl(sbx_va + 40, 0xFFFFFFF007735A34, False),       # b back into the stand-in
+    ]
+    disp_slot.extend(struct.pack(f'<{len(sbx_tramp)}I', *sbx_tramp))
+
     assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
     data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
     data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
@@ -515,6 +557,14 @@ def main():
     # Hook AppleCLCD::start
     patch_u32(data, fo(0xFFFFFFF007A484E0), 0x17FFFFA5,
               encode_bl(0xFFFFFFF007A484E0, start_hook_va, False), 'hook AppleCLCD::start -> publish_modes')
+
+    # Sandbox stand-in entry -> op 2 writes "allow" into libsandbox's result slot
+    patch_u32(data, fo(0xFFFFFFF007735A30), 0xD10183FF,
+              encode_bl(0xFFFFFFF007735A30, sbx_va, False), 'hook _sweet_sandbox_syscall entry (op 2 allow)')
+
+    # Debug: let the crash heap-string scan (patch 0051) also run for SIGTRAP (sig 5): uncaught C++/ObjC
+    # exceptions in daemons die with std::terminate -> brk, and the exception text is what we need.
+    patch_u32(data, fo(0xFFFFFFF0072A9EA0), 0x7100191F, 0x7100151F, 'crash strings: sig >= 5')
 
     # Hook AppleCLCD::externalMethod
     patch_u32(data, fo(0xFFFFFFF007A4949C), 0xB9405288,
@@ -537,6 +587,36 @@ def main():
     patch_u32(data, 0xA449B8, 0xB940518C, 0xB940418C, 'present swap_id +0x40')
     patch_u32(data, 0xA453F0, 0x7111B11F, 0x7109E11F, 'externalMethod SwapEnd min size 0x278')
     patch_u32(data, 0xA453FC, 0x52808D95, 0x52804F15, 'externalMethod SwapEnd copy_len 0x278')
+
+    # 7. Exec bumps pidversion by one, as old XNU did (p->p_idversion++). xnu-8796 sets it to
+    #    a fresh global value instead; iOS 12 launchd keeps an exec count per pid and checks it
+    #    against the caller's audit token, so every lookup from an exec'd job failed with
+    #    error 1100 (rec_execcnt mismatch) -- backboardd's com.apple.CARenderServer lookup
+    #    among them, hence [CADisplay mainDisplay] = nil ("No window server display found").
+    #    exec_handle_sugid: proc_setpidversion(p, proc_pidversion(p) + 1)
+    base = 0xFFFFFFF0077AB374
+    old = struct.unpack_from('<6I', data, fo(base))
+    assert old[2] == encode_bl(base + 8, 0xFFFFFFF007919040, True), 'exec_handle_sugid: no OSIncrementAtomic call'
+    assert old[5] == encode_bl(base + 20, 0xFFFFFFF0077BC700, True), 'exec_handle_sugid: no proc_setpidversion call'
+    new = [
+        0xAA1303E0,                                           # mov x0, x19 (proc)
+        encode_bl(base + 4, 0xFFFFFFF0077BAA50, True),        # bl proc_pidversion
+        0x11000401,                                           # add w1, w0, #1
+        0xAA1303E0,                                           # mov x0, x19
+        0xD503201F,                                           # nop
+        encode_bl(base + 20, 0xFFFFFFF0077BC700, True),       # bl proc_setpidversion
+    ]
+    struct.pack_into('<6I', data, fo(base), *new)
+    print('exec_handle_sugid: pidversion += 1 on exec')
+
+    # 8. Mach message trace: point mach_msg traps 31/32 at the gtel wrappers
+    for trap, orig, wrapper in ((31, EXT_SYMS['_mach_msg_trap'], disp_syms['_gtel_mach_msg_trap']),
+                                (32, EXT_SYMS['_mach_msg_overwrite_trap'], disp_syms['_gtel_mach_msg_overwrite_trap'])):
+        slot = seg_fo(data, MACH_TRAP_TABLE + trap * 32 + 8)
+        cur = struct.unpack_from('<Q', data, slot)[0]
+        assert cur == orig, f'mach_trap_table[{trap}] = {cur:#x}, expected {orig:#x}'
+        struct.pack_into('<Q', data, slot, wrapper)
+        print(f'mach_trap_table[{trap}] -> {wrapper:#x}')
 
     with open(KERN, 'wb') as wf:
         wf.write(data)

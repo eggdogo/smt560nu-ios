@@ -79,8 +79,12 @@ class FastbootDevice:
                 break
         return "\n".join(res)
 
-    def upload(self, timeout=5000):
-        self.ep_out.write(b"upload")
+    def upload_from(self, offset, timeout=8000):
+        """Fetch the log bytes starting at `offset` (single window, <= ~60 KiB)."""
+        return self.upload(timeout=timeout, cmd=b"upload:%x" % offset)
+
+    def upload(self, timeout=5000, cmd=b"upload"):
+        self.ep_out.write(cmd)
         resp = bytes(self.ep_in.read(512, timeout=timeout)).decode('utf-8', errors='ignore')
         if not resp.startswith("DATA"):
             raise RuntimeError(f"Upload command failed: {resp}")
@@ -89,10 +93,23 @@ class FastbootDevice:
         while len(data) < size:
             chunk = self.ep_in.read(min(size - len(data), 65536), timeout=timeout)
             data.extend(chunk)
-        resp2 = bytes(self.ep_in.read(512, timeout=timeout)).decode('utf-8', errors='ignore')
-        if not resp2.startswith("OKAY"):
-            raise RuntimeError(f"Upload trailing status failed: {resp2}")
+        # The gadget sometimes never sends the trailing OKAY after a bulk dump; the
+        # payload is already complete, so don't throw it away over a missing status.
+        try:
+            resp2 = bytes(self.ep_in.read(512, timeout=min(timeout, 1500))).decode('utf-8', errors='ignore')
+            if not resp2.startswith("OKAY"):
+                raise RuntimeError(f"Upload trailing status failed: {resp2}")
+        except usb.core.USBTimeoutError:
+            pass
         return bytes(data)
+
+    def drain(self, timeout=200):
+        """Discard any stale status packets left in the IN pipe."""
+        while True:
+            try:
+                self.ep_in.read(512, timeout=timeout)
+            except usb.core.USBError:
+                return
 
     def dmesg(self):
         return self.upload()
