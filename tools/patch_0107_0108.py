@@ -20,8 +20,8 @@ CODE_MAX = 0x1D60  # 7520 bytes: 0xfffffff0074936b0 .. 0xfffffff007495410
 BSS_BASE = 0xFFFFFFF00803AE38
 BSS_MAX = 0x368    # 872 bytes:  0xfffffff00803ae38 .. 0xfffffff00803b1a0
 
-DISP_CODE_BASE = 0xFFFFFFF00748CD90
-DISP_CODE_MAX = 0x1000  # 4096 bytes: 0xfffffff00748cd90 .. 0xfffffff00748dd90
+DISP_CODE_BASE = 0xFFFFFFF00748FEF0
+DISP_CODE_MAX = 0x34B0  # 13488 bytes: 0xfffffff00748fef0 .. 0xfffffff0074933a0 (_sweet_touch_init.._rh_sync, before _sweet_spmi_init)
 
 TEXT_EXEC_VA = 0xFFFFFFF007260000
 TEXT_EXEC_FOFF = 0x25C000
@@ -54,7 +54,7 @@ EXT_SYMS = {
     '_sweet_log_position':        0xFFFFFFF00748AB30,
     '_thread_block':              0xFFFFFFF0072DAEB0,
     '_thread_deallocate':         0xFFFFFFF0072FF8C0,
-    # Display & VFS symbols
+    # Display symbols
     '_OSDictionary_withCapacity':        0xFFFFFFF007920850,
     '_OSDictionary_setObject':          0xFFFFFFF007921350,
     '_OSArray_withCapacity':             0xFFFFFFF00791CB30,
@@ -63,15 +63,7 @@ EXT_SYMS = {
     '_IORegistryEntry_setProperty':     0xFFFFFFF0079845B0,
     '_IORegistryEntry_setPropertyBool': 0xFFFFFFF0079846B0,
     '_OSObject_release':                0xFFFFFFF00791C060,
-    '_VNOP_FSYNC':                       0xFFFFFFF0074EC5B0,
-    '_vfs_context_kernel':              0xFFFFFFF0074E9BA0,
-    '_vfs_context_proc':                0xFFFFFFF0074E9800,
-    '_vfs_context_ucred':               0xFFFFFFF0074E9C20,
-    '_vn_rdwr':                         0xFFFFFFF0074E2760,
-    '_vnode_close':                     0xFFFFFFF0074C1740,
-    '_vnode_open':                      0xFFFFFFF0074C1660,
     '_bzero':                           0xFFFFFFF007B1F580,
-    '_rootvnode':                       0xFFFFFFF007BCF7F8,
 }
 
 DARWIN_HDR = r'''
@@ -416,7 +408,6 @@ def main():
     publish_va = disp_syms['_gtel_publish_display_modes']
     handle_74_va = disp_syms['_gtel_handle_sel_74']
     handle_79_va = disp_syms['_gtel_handle_sel_79']
-    appoint_va = disp_syms['_gtel_appoint_backboardd']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -426,13 +417,12 @@ def main():
 
     # Trampoline for load_init_program in CODE_BASE
     tramp_va = CODE_BASE + ((len(usb_blob) + 3) & ~3)
-    assert (tramp_va + 28) <= CODE_BASE + CODE_MAX, 'No room for trampoline'
+    assert (tramp_va + 24) <= CODE_BASE + CODE_MAX, 'No room for trampoline'
     tramp = [
         0xA9BF7BFD,                         # stp x29, x30, [sp, #-0x10]!
         0x910003FD,                         # mov x29, sp
         encode_bl(tramp_va + 8,  0xFFFFFFF00748EA50, True),  # bl _gtel_mmc_probe
-        encode_bl(tramp_va + 12, appoint_va,         True),  # bl _gtel_appoint_backboardd
-        encode_bl(tramp_va + 16, start_va,           True),  # bl _gtel_usb_start
+        encode_bl(tramp_va + 12, start_va,           True),  # bl _gtel_usb_start
         0xA8C17BFD,                         # ldp x29, x30, [sp], #0x10
         0xD65F03C0,                         # ret
     ]
@@ -441,7 +431,8 @@ def main():
     patch_u32(data, fo(0xFFFFFFF0077AA7C8), encode_bl(0xFFFFFFF0077AA7C8, 0xFFFFFFF00748EA50, True),
               encode_bl(0xFFFFFFF0077AA7C8, tramp_va, True), 'hook load_init_program')
 
-    # Nop sweet_usb_probe
+    # Nop sweet_touch_init and sweet_usb_probe in sweet_ufs_rootdev
+    patch_u32(data, fo(0xFFFFFFF00748C1D8), encode_bl(0xFFFFFFF00748C1D8, DISP_CODE_BASE, True), 0xD503201F, 'nop sweet_touch_init')
     patch_u32(data, fo(0xFFFFFFF00748C1DC), encode_bl(0xFFFFFFF00748C1DC, CODE_BASE, True), 0xD503201F, 'nop sweet_usb_probe')
 
     # 4. Write Display slot

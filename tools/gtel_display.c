@@ -6,19 +6,8 @@ typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 typedef unsigned long size_t;
 typedef int IOReturn;
-typedef void *vnode_t;
-typedef void *vfs_context_t;
 
 #define NULL ((void *)0)
-#define NULLVP ((vnode_t)0)
-#define FREAD 0x0001
-#define FWRITE 0x0002
-#define UIO_READ 0
-#define UIO_WRITE 1
-#define UIO_SYSSPACE 0
-#define IO_NODELOCKED 0x0001
-#define IO_UNIT 0x0020
-#define MNT_WAIT 1
 
 struct IOExternalMethodArguments {
     uint32_t            version;
@@ -55,19 +44,11 @@ extern int IORegistryEntry_setProperty(void *entry, const char *key, void *val);
 extern int IORegistryEntry_setPropertyBool(void *entry, const char *key, int val);
 extern void OSObject_release(void *obj, int freeResult);
 
-extern vfs_context_t vfs_context_kernel(void);
-extern void *vfs_context_ucred(vfs_context_t);
-extern void *vfs_context_proc(vfs_context_t);
-extern int vnode_open(const char *path, int fmode, int cmode, int flags, vnode_t *vpp, vfs_context_t ctx);
-extern int vnode_close(vnode_t vp, int flags, vfs_context_t ctx);
-extern int vn_rdwr(int rw, vnode_t vp, void *base, int len, int64_t offset, int segflg, int ioflg, void *cred, int *aresid, void *p);
-extern int VNOP_FSYNC(vnode_t vp, int waitfor, vfs_context_t ctx);
-
 extern void bzero(void *dst, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
 extern int printf(const char *fmt, ...);
 
-#define K_OS_BOOLEAN_FALSE ((void *)0xfffffff00804d2e0ULL)
+#define K_OS_BOOLEAN_FALSE (*(void * const *)0xfffffff00804d2e0ULL)
 
 void gtel_publish_display_modes(void *fb) {
     if (!fb) return;
@@ -186,70 +167,29 @@ void gtel_publish_display_modes(void *fb) {
 void gtel_handle_sel_74(struct IOExternalMethodArguments *args) {
     if (args->scalarOutput && args->scalarOutputCount >= 1) {
         args->scalarOutput[0] = 1;
-        args->scalarOutputCount = 1;
+        for (uint32_t i = 1; i < args->scalarOutputCount; i++) {
+            args->scalarOutput[i] = 0;
+        }
     }
-    if (args->structureOutput && args->structureOutputSize >= 64) {
+    if (args->structureOutput && args->structureOutputSize > 0) {
         bzero(args->structureOutput, args->structureOutputSize);
-        uint32_t *fi = (uint32_t *)args->structureOutput;
-        fi[0] = 800;  // width
-        fi[1] = 1280; // height
-        fi[2] = 2400; // rowBytes
-        fi[3] = 60;   // refresh
+        if (args->structureOutputSize >= 16) {
+            uint32_t *fi = (uint32_t *)args->structureOutput;
+            fi[0] = 800;  // width
+            fi[1] = 1280; // height
+            fi[2] = 2400; // rowBytes
+            fi[3] = 60;   // refresh
+        }
     }
 }
 
 void gtel_handle_sel_79(struct IOExternalMethodArguments *args) {
-    if (args->structureOutput && args->structureOutputSize >= 12 &&
-        args->scalarInput && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
+    if (args->structureOutput && args->structureOutputSize > 0) {
         bzero(args->structureOutput, args->structureOutputSize);
-        uint32_t ids[2] = { 1, 1 }; // ColorID=1, TimingID=1
-        memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
-    }
-}
-
-extern void *rootvnode;
-
-void gtel_appoint_backboardd(void) {
-    vnode_t vp = NULLVP;
-    vfs_context_t ctx = vfs_context_kernel();
-    const char *path = "/usr/libexec/backboardd";
-
-    void *root_vp = rootvnode;
-    void *mp = root_vp ? *(void **)((uint8_t *)root_vp + 0xd8) : NULL;
-    uint32_t saved_flags = 0;
-    if (mp) {
-        uint32_t *flag_ptr = (uint32_t *)((uint8_t *)mp + 0x70);
-        if (*flag_ptr & 1) {
-            saved_flags = *flag_ptr;
-            *flag_ptr &= ~1;
+        if (args->structureOutputSize >= 12 &&
+            args->scalarInput && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
+            uint32_t ids[2] = { 1, 1 }; // ColorID=1, TimingID=1
+            memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
         }
-    }
-
-    int err = vnode_open(path, (FREAD | FWRITE), 0, 0, &vp, ctx);
-    if (err == 0) {
-        uint32_t cur = 0;
-        int resid = 0;
-        vn_rdwr(UIO_READ, vp, (void *)&cur, 4, 0x1e920, UIO_SYSSPACE, IO_NODELOCKED,
-                vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-        if (cur == 0xaa0003e2) { // mov x2, x0
-            uint32_t patched = 0x52800022; // mov w2, #1
-            resid = 0;
-            vn_rdwr(UIO_WRITE, vp, (void *)&patched, 4, 0x1e920, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
-                    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-            VNOP_FSYNC(vp, MNT_WAIT, ctx);
-            printf("SWEET: backboardd display driver appointed (mov w2, #1 at 0x1e920)\n");
-        } else if (cur == 0x52800022) {
-            printf("SWEET: backboardd display driver already appointed\n");
-        } else {
-            printf("SWEET: backboardd 0x1e920 has unexpected opcode 0x%08x\n", cur);
-        }
-        vnode_close(vp, (FREAD | FWRITE), ctx);
-    } else {
-        printf("SWEET: cannot open %s (errno %d)\n", path, err);
-    }
-
-    if (mp && saved_flags) {
-        uint32_t *flag_ptr = (uint32_t *)((uint8_t *)mp + 0x70);
-        *flag_ptr = saved_flags;
     }
 }

@@ -1,102 +1,5 @@
-diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 60b9224..60f1a77 100644
---- a/bsd/kern/bsd_init.c
-+++ b/bsd/kern/bsd_init.c
-@@ -1461,6 +1461,84 @@ static const unsigned char sweet_dyld_sig[16] = {
- 	0xe9, 0x03, 0x00, 0x32, 0x09, 0x05, 0x01, 0x39,
- };
- 
-+/*
-+ * Manually appoint backboardd main display driver by patching 0x1e920
-+ * from 0xaa0003e2 (mov x2, x0) to 0x52800022 (mov w2, #1) so that
-+ * [server displayWithDisplayId:1] is called directly.
-+ */
-+#define GTEL_BACKBOARDD_PATH "/usr/libexec/backboardd"
-+#define GTEL_BACKBOARDD_OFF  0x1e920
-+
-+static void
-+gtel_appoint_backboardd(void)
-+{
-+	vnode_t vp = NULLVP;
-+	vfs_context_t ctx = vfs_context_kernel();
-+	mount_t mp = rootvnode ? rootvnode->v_mount : NULL;
-+	uint64_t saved_flags = 0;
-+	uint32_t cur = 0;
-+	uint32_t patched = 0x52800022; /* mov w2, #1 */
-+	int resid = 0;
-+	int error = 0;
-+	int err = 0;
-+
-+	error = vnode_open(GTEL_BACKBOARDD_PATH, FREAD, 0, 0, &vp, ctx);
-+	if (error != 0) {
-+		printf("SWEET: cannot open %s (errno %d)\n", GTEL_BACKBOARDD_PATH, error);
-+		return;
-+	}
-+
-+	err = vn_rdwr(UIO_READ, vp, (caddr_t)&cur, 4,
-+	    GTEL_BACKBOARDD_OFF, UIO_SYSSPACE, IO_NODELOCKED,
-+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+	vnode_close(vp, FREAD, ctx);
-+	if (err != 0 || resid != 0) {
-+		printf("SWEET: cannot read %s (errno %d)\n", GTEL_BACKBOARDD_PATH, err);
-+		return;
-+	}
-+
-+	if (cur == patched) {
-+		printf("SWEET: backboardd display driver already appointed\n");
-+		return;
-+	}
-+	if (cur != 0xaa0003e2) {
-+		printf("SWEET: backboardd at 0x%x has unexpected opcode 0x%08x\n",
-+		    GTEL_BACKBOARDD_OFF, cur);
-+		return;
-+	}
-+
-+	if (mp && (mp->mnt_flag & MNT_RDONLY)) {
-+		saved_flags = mp->mnt_flag;
-+		mp->mnt_flag &= ~MNT_RDONLY;
-+	}
-+
-+	vp = NULLVP;
-+	error = vnode_open(GTEL_BACKBOARDD_PATH, (FREAD | FWRITE), 0, 0, &vp, ctx);
-+	if (error != 0) {
-+		printf("SWEET: cannot open %s for write (errno %d)\n", GTEL_BACKBOARDD_PATH, error);
-+		goto out;
-+	}
-+
-+	resid = 0;
-+	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&patched, 4,
-+	    GTEL_BACKBOARDD_OFF, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
-+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+	(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
-+	vnode_close(vp, FWRITE, ctx);
-+
-+	if (err == 0 && resid == 0) {
-+		printf("SWEET: backboardd display driver appointed (mov w2, #1 at 0x%x)\n",
-+		    GTEL_BACKBOARDD_OFF);
-+	} else {
-+		printf("SWEET: backboardd display appointment failed (errno %d)\n", err);
-+	}
-+
-+out:
-+	if (mp && saved_flags) {
-+		mp->mnt_flag = saved_flags;
-+	}
-+}
-+
- static void
- sweet_revert_dyld_bind_at_load(void)
- {
-@@ -1567,6 +1645,7 @@ bsdinit_task(void)
- #if defined(ARM64_BOARD_CONFIG_SWEET)
- 	sweet_inject_gestalt_cache();
- 	sweet_revert_dyld_bind_at_load();
-+	gtel_appoint_backboardd();
- #endif
- 
- 	load_init_program(p);
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 61b3ec7..8198a6a 100644
+index 61b3ec7..6837f01 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -205,6 +205,115 @@ AppleCLCD::start(IOService *provider)
@@ -220,10 +123,8 @@ index 61b3ec7..8198a6a 100644
  		}
  		break;
 +	case 74: /* kSweetFBSupportedFrameInfo */
-+		if (args->scalarOutput && args->scalarOutputCount >= 1) {
-+			args->scalarOutput[0] = 1;
-+			args->scalarOutputCount = 1;
-+		}
++		out[0] = 1;
++		outCount = 1;
 +		if (args->structureOutput && args->structureOutputSize >= 64) {
 +			bzero(args->structureOutput, args->structureOutputSize);
 +			uint32_t *fi = (uint32_t *)args->structureOutput;
@@ -234,11 +135,13 @@ index 61b3ec7..8198a6a 100644
 +		}
 +		break;
 +	case 79: /* kSweetFBGetBlock */
-+		if (args->structureOutput && args->structureOutputSize >= 12 &&
-+		    args->scalarInput && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
++		if (args->structureOutput && args->structureOutputSize > 0) {
 +			bzero(args->structureOutput, args->structureOutputSize);
-+			uint32_t ids[2] = { 1, 1 }; /* ColorID=1, TimingID=1 */
-+			memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			if (args->structureOutputSize >= 12 &&
++			    args->scalarInput && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
++				uint32_t ids[2] = { 1, 1 }; /* ColorID=1, TimingID=1 */
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
 +		}
 +		break;
 +	case 73: /* kSweetFBChangeFrameInfo */
