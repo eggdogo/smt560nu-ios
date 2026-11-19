@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..c68e5ce
 --- /dev/null
 +++ b/bsd/dev/gtel_usb.c
-@@ -0,0 +1,1209 @@
+@@ -0,0 +1,1226 @@
 +/*
 + * gtel MSM8916 ChipIdea HS-USB fastboot gadget + poweroff/reboot.
 + *
@@ -921,11 +921,21 @@ index 0000000..c68e5ce
 +/* ---- Fastboot command handlers ---- */
 +
 +static void
-+fastboot_upload(void)
++fastboot_upload_from(uint64_t from, bool windowed)
 +{
 +	uint64_t end = sweet_log_position();
 +	uint64_t avail = (end > GTEL_LOG_RING_SIZE) ? GTEL_LOG_RING_SIZE : end;
 +	uint64_t pos = end - avail;
++	if (windowed) {
++		/* single-chunk window starting at `from`: multi-chunk dumps stall above 64 KiB */
++		if (from > pos) {
++			pos = from > end ? end : from;
++		}
++		avail = end - pos;
++		if (avail > GTEL_TX_BUF_SIZE - 4096u) {
++			avail = GTEL_TX_BUF_SIZE - 4096u;
++		}
++	}
 +	uint64_t rem = avail;
 +	char hdr[16];
 +
@@ -988,7 +998,14 @@ index 0000000..c68e5ce
 +		gtel_do_reboot(false);
 +	} else if (strcmp(cmd, "oem dmesg") == 0 ||
 +	    strcmp(cmd, "upload") == 0) {
-+		fastboot_upload();
++		fastboot_upload_from(0, false);
++	} else if (strncmp(cmd, "upload:", 7) == 0) {
++		uint64_t from = 0;
++		for (const char *h = cmd + 7; *h; h++) {
++			char c = *h;
++			from = (from << 4) | (uint64_t)((c >= 'a') ? (c - 'a' + 10) : (c >= 'A') ? (c - 'A' + 10) : (c - '0'));
++		}
++		fastboot_upload_from(from, true);
 +	} else if (strcmp(cmd, "oem help") == 0) {
 +		(void)ep1_tx_sync("INFOok", 6u);
 +		(void)ep1_tx_sync("OKAY", 4u);

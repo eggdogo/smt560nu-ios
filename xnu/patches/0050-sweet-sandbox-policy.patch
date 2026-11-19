@@ -1,6 +1,6 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -272,10 +272,54 @@
+@@ -272,10 +272,67 @@
  	return 0;
  }
  
@@ -17,13 +17,26 @@
 +static uint64_t sweet_sandbox_seen;
 +
 +static int
-+sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 +{
 +	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
 +		sweet_sandbox_seen |= 1ULL << call;
 +		char name[32];
 +		proc_name(proc_pid(p), name, sizeof(name));
 +		printf("SWEET Sandbox: %s op %d\n", name, call);
++	}
++	/*
++	 * sandbox_check*() (op 2): libsystem_sandbox returns (*args[0] != 0), where
++	 * args[0] points at an uninitialised stack slot the real kext fills in.
++	 * Write 0 ("allow") there, or launchd reads junk and denies mach-lookup.
++	 */
++	if (call == 2) {
++		user_addr_t slot = 0;
++		uint64_t zero = 0;
++		if (copyin(arg, &slot, sizeof(slot)) == 0 && slot != 0) {
++			(void)copyout(&zero, slot, sizeof(zero));
++		}
++		return 0;
 +	}
 +	switch (call) {
 +	case 4:         /* container path (audit token / pid) */
@@ -55,7 +68,7 @@
  static struct mac_policy_conf sweet_amfi_mac_conf = {
  	.mpc_name = "SWEET AMFI",
  	.mpc_fullname = "SWEET built-in Mobile File Integrity",
-@@ -293,5 +337,8 @@
+@@ -293,5 +338,8 @@
  	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
  	printf("SWEET AMFI: platform binary policy %s (%d)\n",
  	    error ? "NOT registered" : "registered", error);
