@@ -63,7 +63,7 @@ EXT_SYMS = {
     '_IORegistryEntry_setProperty':     0xFFFFFFF0079845B0,
     '_IORegistryEntry_setPropertyBool': 0xFFFFFFF0079846B0,
     '_OSObject_release':                0xFFFFFFF00791C060,
-    '_bzero':                           0xFFFFFFF007B1F580,
+    '_bzero':                           0xFFFFFFF007B1F500,  # was 0x7B1F580 (= _memset): bzero(buf,n) ran memset(buf,n,garbage)
 }
 
 DARWIN_HDR = r'''
