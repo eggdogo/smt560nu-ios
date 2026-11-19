@@ -60,6 +60,8 @@ EXT_SYMS = {
     '_proc_pidversion':           0xFFFFFFF0077BAA50,
     '_copyin':                    0xFFFFFFF007418F30,
     '_proc_getcsflags':           0xFFFFFFF0077BBAB0,
+    '_get_user_regs':             0xFFFFFFF007435DE0,
+    '_current_thread':            0xFFFFFFF00742D7B0,
     '_proc_pid':                  0xFFFFFFF0077BA9F0,
     '_proc_name':                 0xFFFFFFF0077BBF90,
     '_snprintf':                  0xFFFFFFF0077EF960,
@@ -450,6 +452,9 @@ def main():
     exit_log_va = disp_syms['_gtel_exit_log']
     sig_log_va = disp_syms['_gtel_sig_log']
     csops_log_va = disp_syms['_gtel_csops_log']
+    surf_log_va = disp_syms['_gtel_surf_log']
+    regs_log_va = disp_syms['_gtel_regs_log']
+    surf_pre_va = disp_syms['_gtel_surf_pre']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -603,6 +608,56 @@ def main():
     ]
     disp_slot.extend(struct.pack(f'<{len(cs_tramp)}I', *cs_tramp))
 
+    rs_va = DISP_CODE_BASE + len(disp_slot)
+    rs_stub_va = rs_va + 12 * 4
+    rs_tramp = [
+        0xA9BD7BFD,                                              # stp x29, x30, [sp, #-0x30]!
+        0xA90153F3,                                              # stp x19, x20, [sp, #0x10]
+        0x910003FD,                                              # mov x29, sp
+        0xAA0103F3,                                              # mov x19, x1 (SweetSurface *)
+        0xAA0203F4,                                              # mov x20, x2 (args)
+        encode_bl(rs_va + 20, rs_stub_va, True),                 # bl stub (runs returnSurface, comes back here)
+        0xF90013E0,                                              # str x0, [sp, #0x20]
+        0xAA1303E0,                                              # mov x0, x19
+        0xAA1403E1,                                              # mov x1, x20
+        encode_bl(rs_va + 36, surf_log_va, True),                # bl gtel_surf_log
+        0xF94013E0,                                              # ldr x0, [sp, #0x20]
+        0xA94153F3,                                              # ldp x19, x20, [sp, #0x10]
+    ]
+    rs_tramp += [0xA8C37BFD, 0xD65F03C0]                         # ldp x29, x30, [sp], #0x30 ; ret
+    rs_stub = [0xD10343FF, encode_bl(rs_stub_va + 4, 0xFFFFFFF007A45F94, False)]   # orig sub sp,sp,#0xd0 ; b returnSurface+4
+    assert len(rs_tramp) == 14
+    rs_stub_va = rs_va + len(rs_tramp) * 4
+    rs_tramp[5] = encode_bl(rs_va + 20, rs_stub_va, True)
+    rs_stub[1] = encode_bl(rs_stub_va + 4, 0xFFFFFFF007A45F94, False)
+    disp_slot.extend(struct.pack(f'<{len(rs_tramp)}I', *rs_tramp))
+    disp_slot.extend(struct.pack(f'<{len(rs_stub)}I', *rs_stub))
+
+    rg_va = DISP_CODE_BASE + len(disp_slot)
+    rg_tramp = [
+        0xA9BA7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        encode_bl(rg_va + 20, regs_log_va, True),
+        0xA94107E0, 0xA9420FE2, 0xA94317E4, 0xA8C67BFD,
+        0xA9BA6FFC,                                              # orig: stp x28, x27, [sp, #-0x60]!
+        encode_bl(rg_va + 44, 0xFFFFFFF0072A8F34, False),        # b sweet_crash_log+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(rg_tramp)}I', *rg_tramp))
+
+    sp_va = DISP_CODE_BASE + len(disp_slot)
+    sp_tramp = [
+        0xA9BC7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        0xAA0203E0,                                              # mov x0, x2 (args)
+        encode_bl(sp_va + 24, surf_pre_va, True),                # bl gtel_surf_pre(args, selector)
+        0x2A0003E6,                                              # mov w6, w0
+        0xF9400BE0,                                              # ldr x0, [sp, #0x10] (this)
+        0xA9420FE2, 0xA94317E4,                                  # ldp x2,x3 / x4,x5
+        0x2A0603E1,                                              # mov w1, w6 (new selector)
+        0xA8C47BFD,                                              # ldp x29, x30, [sp], #0x40
+        0xD10283FF,                                              # orig: sub sp, sp, #0xa0
+        encode_bl(sp_va + 56, 0xFFFFFFF007A46EC4, False),        # b externalMethod+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(sp_tramp)}I', *sp_tramp))
+
     assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
     data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
     data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
@@ -623,6 +678,12 @@ def main():
     for va, exp in ((0xFFFFFFF0077BF888, 0x54002D80), (0xFFFFFFF0077BFA5C, 0x54001EE0), (0xFFFFFFF0077BFC14, 0x54001120)):
         patch_u32(data, fo(va), exp, 0xD503201F, f'csops: ignore missing CS_VALID @{va:#x}')
     patch_u32(data, fo(0xFFFFFFF0077BF73C), 0x540001C1, 0xD503201F, 'csops audit token: ignore pidversion mismatch')
+    patch_u32(data, fo(0xFFFFFFF007A46EC0), 0xD10283FF,
+              encode_bl(0xFFFFFFF007A46EC0, sp_va, False), 'hook IOSurface externalMethod (iOS 12 lock = selector 2)')
+    patch_u32(data, fo(0xFFFFFFF0072A8F30), 0xA9BA6FFC,
+              encode_bl(0xFFFFFFF0072A8F30, rg_va, False), 'hook sweet_crash_log entry (REGS dump)')
+    patch_u32(data, fo(0xFFFFFFF007A45F90), 0xD10343FF,
+              encode_bl(0xFFFFFFF007A45F90, rs_va, False), 'hook IOSurface returnSurface (SURFREPLY log)')
     patch_u32(data, fo(0xFFFFFFF0077BF5F0), 0xD10383FF,
               encode_bl(0xFFFFFFF0077BF5F0, cs_va, False), 'hook csops_internal entry (CSOPS log)')
     patch_u32(data, fo(0xFFFFFFF0077CA5A0), 0xD102C3FF,

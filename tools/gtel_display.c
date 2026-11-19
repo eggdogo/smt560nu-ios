@@ -433,3 +433,85 @@ void gtel_csops_log(int pid, int ops, uint64_t uaddr, uint64_t usize, uint64_t u
     int er = cs_entitlements_blob_get(current_proc(), &eb, &el);
     printf("CSOPS csflags 0x%x blob_get rc %d len %d ptr %p\n", (unsigned)proc_getcsflags(current_proc()), er, (int)el, eb);
 }
+
+/* IOSurfaceRootUserClient::returnSurface() return hook: what does the create/lookup reply contain? */
+void gtel_surf_log(uint64_t s, uint64_t args) {
+    volatile uint32_t *c = (volatile uint32_t *)0xfffffff00803b194ULL;
+    int doprint = (*c <= 12);
+    if (doprint) *c = *c + 1;
+    const uint8_t *out = *(const uint8_t **)(args + 0x58);
+    uint32_t osz = *(volatile uint32_t *)(args + 0x60);
+    uint64_t desc = *(volatile uint64_t *)(args + 0x68);
+    if (!out) { printf("SURFREPLY no inline out (desc %p, size %u)\n", (void *)desc, osz); return; }
+    {
+        /* The data mapping address is reported as -1 on re-lookups (IOSurfaceLock): remember the address given at create time and put it back. */
+        volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b1c0ULL;   /* 16 x {id, addr} */
+        uint32_t sid = *(const uint32_t *)(out + 0x18);
+        uint64_t ad = *(const uint64_t *)(out + 0);
+        int slot = -1;
+        for (int i = 0; i < 16; i++) if (tab[2 * i] == sid && sid != 0) { slot = i; break; }
+        if (ad != ~0ULL && ad != 0) {
+            if (slot < 0) for (int i = 0; i < 16; i++) if (tab[2 * i] == 0) { slot = i; break; }
+            if (slot >= 0) { tab[2 * slot] = sid; tab[2 * slot + 1] = ad; }
+        } else if (slot >= 0) {
+            *(volatile uint64_t *)(out) = tab[2 * slot + 1];
+        }
+    }
+    uint64_t a = *(const uint64_t *)(out + 0);
+    if (!doprint) return;
+    printf("SURFREPLY addr 0x%llx state 0x%llx id %u alloc %u w %u h %u bpr %u off %u planes %u outsize %u\n", a,
+           *(const uint64_t *)(out + 8), *(const uint32_t *)(out + 0x18), *(const uint32_t *)(out + 0x1c),
+           *(const uint32_t *)(out + 0x20), *(const uint32_t *)(out + 0x24), *(const uint32_t *)(out + 0x28),
+           *(const uint32_t *)(out + 0x2c), *(const uint32_t *)(out + 0x38), osz);
+}
+
+/* sweet_crash_log() hook: dump the faulting thread's registers for backboardd */
+extern void *get_user_regs(void *thread);
+extern void *current_thread(void);
+void gtel_regs_log(const char *name, int pid, int sig) {
+    if (!gtel_streq(name, "backboardd")) return;
+    volatile uint32_t *c = (volatile uint32_t *)0xfffffff00803b198ULL;
+    if (*c > 1) return;
+    *c = *c + 1;
+    const uint64_t *r = (const uint64_t *)get_user_regs(current_thread());
+    if (!r) return;
+    const uint64_t *x = r + 1;       /* skip arm_state_hdr */
+    printf("REGS %s[%d] sig %d x0-x7 %llx %llx %llx %llx %llx %llx %llx %llx\n", name, pid, sig, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
+    printf("REGS x8-x15 %llx %llx %llx %llx %llx %llx %llx %llx\n", x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]);
+    printf("REGS x16-x23 %llx %llx %llx %llx %llx %llx %llx %llx\n", x[16], x[17], x[18], x[19], x[20], x[21], x[22], x[23]);
+    {
+        uint64_t m[14];
+        for (int i = 0; i < 14; i++) m[i] = 0xdead;
+        int ce = copyin(x[12], m, sizeof(m));
+        printf("REGS mem@x12 (%d) %llx %llx %llx %llx %llx %llx %llx %llx\n", ce, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+        printf("REGS mem@x12+0x40 %llx %llx %llx %llx %llx %llx\n", m[8], m[9], m[10], m[11], m[12], m[13]);
+        ce = copyin(x[12] + 0x650, m, sizeof(m));
+        printf("REGS ctx+0x650 (%d) %llx %llx %llx %llx %llx %llx %llx %llx\n", ce, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+        printf("REGS ctx+0x690 %llx %llx %llx %llx %llx %llx\n", m[8], m[9], m[10], m[11], m[12], m[13]);
+        {
+            uint64_t q[16];
+            for (int i = 0; i < 16; i++) q[i] = 0xdead;
+            ce = copyin(x[22] + 0x50, q, sizeof(q));
+            printf("REGS x22+0x50 (%d) %llx %llx %llx %llx %llx %llx %llx %llx\n", ce, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+            printf("REGS x22+0x90 %llx %llx %llx %llx %llx %llx %llx %llx\n", q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+        }
+        ce = copyin(x[19], m, sizeof(m));
+        printf("REGS mem@x19 (%d) %llx %llx %llx %llx %llx %llx %llx %llx\n", ce, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+    }
+    printf("REGS x24-x28 %llx %llx %llx %llx %llx fp %llx lr %llx sp %llx pc %llx\n", x[24], x[25], x[26], x[27], x[28], x[29], x[30], x[31], x[32]);
+}
+
+/* IOSurfaceRootUserClient::externalMethod() pre-hook: iOS 12's IOSurfaceLock is selector 2 (input struct {id, options, ...},
+ * output = the lock result that the client copies over its surface record, base address at +0). Map it onto the
+ * kernel's lookup (selector 4), which answers with exactly that result structure. */
+uint32_t gtel_surf_pre(uint64_t args, uint32_t selector) {
+    if (selector != 2) return selector;
+    const uint8_t *in = *(const uint8_t **)(args + 0x30);
+    uint32_t insz = *(volatile uint32_t *)(args + 0x38);
+    if (!in || insz < 4) return selector;
+    volatile uint64_t *slot = (volatile uint64_t *)0xfffffff00803b1a0ULL;
+    *slot = *(const uint32_t *)in;
+    *(volatile uint64_t *)(args + 0x20) = (uint64_t)slot;     /* scalarInput */
+    *(volatile uint32_t *)(args + 0x28) = 1;                   /* scalarInputCount */
+    return 4;
+}
