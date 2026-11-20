@@ -269,7 +269,7 @@ static int gtel_msg_trace(const uint64_t *args) {
     if (!(option & 1) || size < 24) return 0;          /* not a send */
     name[0] = 0;
     proc_selfname(name, sizeof(name));
-    int is_ui = gtel_streq(name, "backboardd") || gtel_streq(name, "SpringBoard");
+    int is_ui = gtel_streq(name, "backboardd") || gtel_streq(name, "SpringBoard") || gtel_streq(name, "lsd");
     if (is_ui && gtel_streq(name, "SpringBoard")) {
         volatile uint32_t *pc = (volatile uint32_t *)0xfffffff00803b18cULL;
         uint32_t n = *pc + 1;
@@ -291,10 +291,11 @@ static int gtel_msg_trace(const uint64_t *args) {
     if (is_ui) {
         int ca = gtel_find(buf, n, "CARenderServer");
         if (ca < 0) ca = gtel_find(buf, n, "profiled");
+        if (ca < 0 && gtel_streq(name, "lsd")) ca = gtel_find(buf, n, "icon");
         if (id != 0x9d27 && id != 0x9d8b && ca < 0) {
             /* compact one-liner for every other send, first 200 only (free BSS word next to `watch`) */
             volatile uint32_t *cnt = (volatile uint32_t *)0xfffffff00803b184ULL;
-            if (*cnt < 200) {
+            if (*cnt < 700) {
                 *cnt = *cnt + 1;
                 printf("MSGS %s id 0x%x bits 0x%x size %u remote 0x%x\n", name, id, h[0], h[1], h[2]);
             }
@@ -505,6 +506,38 @@ void gtel_regs_log(const char *name, int pid, int sig) {
  * output = the lock result that the client copies over its surface record, base address at +0). Map it onto the
  * kernel's lookup (selector 4), which answers with exactly that result structure. */
 uint32_t gtel_surf_pre(uint64_t args, uint32_t selector) {
+    {
+        volatile uint8_t *cnt = (volatile uint8_t *)0xfffffff00803b1b0ULL;   /* 16 per-selector counters */
+        uint32_t k = selector & 15;
+        if (cnt[k] < 3) {
+            cnt[k]++;
+            char sn[24];
+            sn[0] = 0;
+            proc_selfname(sn, sizeof(sn));
+            printf("SURFSEL %u from %s[%d]: scin %u insz %u scout %u outsz %u\n", selector, sn, proc_selfpid(),
+                   *(volatile uint32_t *)(args + 0x28), *(volatile uint32_t *)(args + 0x38),
+                   *(volatile uint32_t *)(args + 0x50), *(volatile uint32_t *)(args + 0x60));
+        }
+    }
+    if (selector == 3) {
+        volatile uint32_t *pc = (volatile uint32_t *)0xfffffff00803b1a8ULL;
+        const uint8_t *in3 = *(const uint8_t **)(args + 0x30);
+        if (in3 && *pc < 14) {
+            volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b1c0ULL;
+            uint32_t sid = *(const uint32_t *)in3;
+            for (int i = 0; i < 16; i++) if (tab[2 * i] == sid && sid) {
+                *pc = *pc + 1;
+                uint32_t nz = 0, v, first = 0;
+                for (int k = 0; k < 64; k++) {
+                    uint64_t ua = tab[2 * i + 1] + (uint64_t)k * 66560ULL + 4;
+                    if (copyin(ua, &v, 4) == 0 && v != 0) { nz++; if (!first) first = v; }
+                }
+                printf("SURFPIX id %u nonzero %u/64 first %x\n", sid, nz, first);
+                break;
+            }
+        }
+    }
+    if (selector == 33) return 4;   /* IOSurfaceLookup(id): scalar id in, full surface record out */
     if (selector != 2) return selector;
     const uint8_t *in = *(const uint8_t **)(args + 0x30);
     uint32_t insz = *(volatile uint32_t *)(args + 0x38);
