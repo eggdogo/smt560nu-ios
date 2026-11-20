@@ -21,4 +21,5 @@ PY
 python tools/flash_block.py ipsw/gtelroot.img.zst userdata 480215 --expect-file $SP/mo.bin --new-file $SP/mn.bin --at 624 | tail -1
 python tools/dscpatch.py 0x183d2c47c ff4302d1f65706a9 000080d2c0035fd6 | tail -1   # ACAccountStore accounts -> nil (breaks lsd/profiled/accountsd cycle)
 python tools/dscpatch.py 0x183e02a70 f657bda9f44f01a9 c0035fd61f2003d5 | tail -1   # MCProfileConnection checkIn -> ret
+python tools/dscpatch.py 0x1a92767b8 ff4303d1f6570aa9 000080d2c0035fd6 | tail -1   # _LSServer_LSEnumerateAndRegisterAllBundles -> return 0 (lsd seeding is far too slow on PIO eMMC)
 echo "reset done (bootcycle.sh flips the HFS dirty bit before each boot)"
