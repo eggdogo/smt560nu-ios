@@ -275,3 +275,15 @@ Usage note: weekly plan usage was 36% at this point.
   (`[client+0x60] + 0x30` = a read of the surface's shared *state page* timestamps with client+0x60 == NULL) so some IOSurface client record has no state-page address (a client created from some other selector's reply: iOS 12 selectors 5/9/22/26 and a
   possible lookup-from-port are still answered with zeros by the default case). REGS dump of x22+0x50 was all zeros (register had been reused; not conclusive).
 - Next: identify which selector builds the client record that ends up with state==0 (log every IOSurfaceRoot selector with its input/output sizes, give each its real iOS 12 reply), then re-test; keep the display photo workflow (user can look at the tablet).
+
+## 2026-11-20 night session: backboardd fixed, SpringBoard past lsd, eMMC speed experiment hung the tablet
+- **backboardd crash loop fixed**: IOSurface selector 33 (IOSurfaceLookup by id; 1 scalar in, 3536-byte record out) is mapped to the kernel lookup (selector 4) in `gtel_surf_pre`.
+  backboardd now creates surfaces 2/3, locks/unlocks (sel 2/3) and swaps them (SWEET FB swap), no crashes. Surfaces are still opaque black (SURFPIX probe: all 0xff000000 or 0).
+- **SpringBoard stall chain (all fixed or understood)**: SB -> lsd (LSCopyServerStore) -> lsd DB seeding.
+  - lsdiconservice blocked in libMobileGestalt waiting for IONetworkController (no `wlan`/`sdio` node with `local-mac-address`): fixed by a `wlan` node under arm-io in `tools/mkadt.py` (NOTE: `local_pack.sh` reads gtel.adt from the GitHub repo dir, copy it there).
+  - lsd/profiled/accountsd cycle: dyld cache patches `-[ACAccountStore accounts]` -> nil (0x183d2c47c) and `-[MCProfileConnection checkIn]` -> ret (0x183e02a70), both in `tools/reset_userdata.sh`.
+  - lsd DB seeding enumerates every bundle (slow: PIO eMMC page-ins); `_LSServer_LSEnumerateAndRegisterAllBundles` (0x1a92767b8) patched to `mov x0,#0; ret` (dscpatch; NOT in reset_userdata.sh yet). With it SB gets past lsd and blocks in `BKSProcessAssertion` -> backboardd, which waits on mediaserverd (Fig/vfbremote ping; mediaserverd is busy in a 0x102... dylib).
+  - A surface id 7 from mediaserverd had non-black pixels (9/64 sampled, first 80000000) -> first real rendering seen.
+- MobileGestalt: full CacheExtra makes backboardd throw NSNull, so keep the trimmed variant (`mkvar_gestalt.py ... B` keeps nested entry B and works; L and A variants also fine).
+- New debug hooks: `SURFSEL` selector log, `SURFPIX` surface sampler on unlock, `RDIR` (hfs_vnop_readdir path + seconds since boot) for containermanagerd/lsd, `MSG` tracer also for lsd.
+- **eMMC speed-up experiment (off by default, `GTEL_MMC_FAST=1`)**: the eMMC runs 1-bit at 25 MHz in PIO mode and everything is slow because of it. `gtel_mmc_fast()` in gtel_display.c switches to 8-bit + HS 50 MHz after the 25 MHz clock call (patch site 0xfffffff00748e8b8). With it enabled the tablet never enumerated on USB again after boot (probably a hard hang on the 8-bit switch). **The tablet needs a physical power cycle (hold power, then lk2nd) after that boot.** Try 4-bit only (host ctrl 0x02, EXT_CSD width 1) before 8-bit next time.

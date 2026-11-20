@@ -58,6 +58,10 @@ EXT_SYMS = {
     '_current_proc':              0xFFFFFFF007918480,
     '_cs_entitlements_blob_get':  0xFFFFFFF007735340,
     '_proc_pidversion':           0xFFFFFFF0077BAA50,
+    '_vn_getpath':                0xFFFFFFF0074BDAA0,
+    '_sdhci_set_clock_khz':       0xFFFFFFF00748F340,
+    '_mmc_cmd':                   0xFFFFFFF00748EFA0,
+    '_mmc_read_block':            0xFFFFFFF00748DD30,
     '_copyin':                    0xFFFFFFF007418F30,
     '_proc_getcsflags':           0xFFFFFFF0077BBAB0,
     '_get_user_regs':             0xFFFFFFF007435DE0,
@@ -455,6 +459,8 @@ def main():
     surf_log_va = disp_syms['_gtel_surf_log']
     regs_log_va = disp_syms['_gtel_regs_log']
     surf_pre_va = disp_syms['_gtel_surf_pre']
+    rdir_log_va = disp_syms['_gtel_rdir_log']
+    mmc_fast_va = disp_syms['_gtel_mmc_fast']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -658,6 +664,16 @@ def main():
     ]
     disp_slot.extend(struct.pack(f'<{len(sp_tramp)}I', *sp_tramp))
 
+    rd_va = DISP_CODE_BASE + len(disp_slot)
+    rd_tramp = [
+        0xA9BA7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        encode_bl(rd_va + 20, rdir_log_va, True),                # bl gtel_rdir_log(ap)
+        0xA94107E0, 0xA9420FE2, 0xA94317E4, 0xA8C67BFD,
+        0xD10483FF,                                              # orig: sub sp, sp, #0x120
+        encode_bl(rd_va + 44, 0xFFFFFFF007785214, False),        # b hfs_vnop_readdir+4
+    ]
+    disp_slot.extend(struct.pack(f'<{len(rd_tramp)}I', *rd_tramp))
+
     assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
     data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
     data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
@@ -686,6 +702,11 @@ def main():
               encode_bl(0xFFFFFFF007A45F90, rs_va, False), 'hook IOSurface returnSurface (SURFREPLY log)')
     patch_u32(data, fo(0xFFFFFFF0077BF5F0), 0xD10383FF,
               encode_bl(0xFFFFFFF0077BF5F0, cs_va, False), 'hook csops_internal entry (CSOPS log)')
+    if os.environ.get('GTEL_MMC_FAST') == '1':   # experimental: hung the tablet on 2026-11-20 (no USB afterwards), off by default
+        patch_u32(data, fo(0xFFFFFFF00748E8B8), encode_bl(0xFFFFFFF00748E8B8, 0xFFFFFFF00748F340, True),
+                  encode_bl(0xFFFFFFF00748E8B8, mmc_fast_va, True), 'eMMC: 8-bit HS 50 MHz after the 25 MHz clock call')
+    patch_u32(data, fo(0xFFFFFFF007785210), 0xD10483FF,
+              encode_bl(0xFFFFFFF007785210, rd_va, False), 'hook hfs_vnop_readdir entry (RDIR log)')
     patch_u32(data, fo(0xFFFFFFF0077CA5A0), 0xD102C3FF,
               encode_bl(0xFFFFFFF0077CA5A0, sg_va, False), 'hook psignal_internal entry (SIG log)')
 

@@ -140,6 +140,7 @@ def build(target='ipad'):
         gic,
         uart,
         node('wdt', [ph(), ('no-pmu', u32(1))]),
+        node('wlan', [ph(), ('device_type', cstr('wlan')), ('compatible', cstr('gtel,wlan')), ('local-mac-address', bytes([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]))]),
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),

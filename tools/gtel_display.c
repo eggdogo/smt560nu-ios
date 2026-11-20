@@ -292,6 +292,7 @@ static int gtel_msg_trace(const uint64_t *args) {
         int ca = gtel_find(buf, n, "CARenderServer");
         if (ca < 0) ca = gtel_find(buf, n, "profiled");
         if (ca < 0 && gtel_streq(name, "lsd")) ca = gtel_find(buf, n, "icon");
+        if (ca < 0) ca = gtel_find(buf, n, "lsd");
         if (id != 0x9d27 && id != 0x9d8b && ca < 0) {
             /* compact one-liner for every other send, first 200 only (free BSS word next to `watch`) */
             volatile uint32_t *cnt = (volatile uint32_t *)0xfffffff00803b184ULL;
@@ -530,7 +531,7 @@ uint32_t gtel_surf_pre(uint64_t args, uint32_t selector) {
                 uint32_t nz = 0, v, first = 0;
                 for (int k = 0; k < 64; k++) {
                     uint64_t ua = tab[2 * i + 1] + (uint64_t)k * 66560ULL + 4;
-                    if (copyin(ua, &v, 4) == 0 && v != 0) { nz++; if (!first) first = v; }
+                    if (copyin(ua, &v, 4) == 0 && v != 0xff000000u && v != 0) { nz++; if (!first) first = v; }
                 }
                 printf("SURFPIX id %u nonzero %u/64 first %x\n", sid, nz, first);
                 break;
@@ -547,4 +548,57 @@ uint32_t gtel_surf_pre(uint64_t args, uint32_t selector) {
     *(volatile uint64_t *)(args + 0x20) = (uint64_t)slot;     /* scalarInput */
     *(volatile uint32_t *)(args + 0x28) = 1;                   /* scalarInputCount */
     return 4;
+}
+
+/* eMMC speed-up: the driver identifies the card at 25 MHz on a 1-bit bus. After its sdhci_set_clock_khz(25000) call, switch the card to
+ * an 8-bit bus + high-speed timing (EXT_CSD BUS_WIDTH=2, HS_TIMING=1) and the host to 50 MHz; verify the GPT header reads back
+ * and fall back to the slow mode when it does not. */
+extern void sdhci_set_clock_khz(uint32_t khz);
+extern int mmc_cmd(uint8_t idx, uint32_t arg, uint8_t flags, uint32_t *resp);
+extern int mmc_read_block(uint64_t lba, uint32_t *buf);
+void gtel_mmc_fast(uint32_t khz) {
+    sdhci_set_clock_khz(khz);
+    volatile uint8_t *hc = (volatile uint8_t *)*(volatile uint64_t *)0xfffffff00803a900ULL;
+    static uint32_t blk[128];
+    uint32_t r = 0;
+    /* BUS_WIDTH (index 183) = 2: 8-bit SDR */
+    if (mmc_cmd(6, (3u << 24) | (183u << 16) | (2u << 8), 0x1b, &r)) { printf("gtel mmc: fast: CMD6 width failed\n"); return; }
+    hc[0x28] = (uint8_t)(hc[0x28] | 0x20);
+    /* HS_TIMING (index 185) = 1 */
+    if (mmc_cmd(6, (3u << 24) | (185u << 16) | (1u << 8), 0x1b, &r)) { printf("gtel mmc: fast: CMD6 timing failed\n"); }
+    else {
+        hc[0x28] = (uint8_t)(hc[0x28] | 0x04);
+        sdhci_set_clock_khz(50000);
+    }
+    int bad = mmc_read_block(1, blk);
+    if (!bad && !(blk[0] == 0x20494645 && blk[1] == 0x54524150)) bad = 1;
+    if (bad) {
+        printf("gtel mmc: fast mode verify failed, back to 1-bit 25 MHz\n");
+        sdhci_set_clock_khz(25000);
+        hc[0x28] = (uint8_t)(hc[0x28] & ~0x04u);
+        mmc_cmd(6, (3u << 24) | (185u << 16) | (0u << 8), 0x1b, &r);
+        mmc_cmd(6, (3u << 24) | (183u << 16) | (0u << 8), 0x1b, &r);
+        hc[0x28] = (uint8_t)(hc[0x28] & ~0x20u);
+        return;
+    }
+    printf("gtel mmc: fast mode on: 8-bit, 50 MHz\n");
+}
+
+/* hfs_vnop_readdir() entry hook: which directory is a daemon enumerating (and how often)? */
+extern int vn_getpath(void *vp, char *pathbuf, int *len);
+void gtel_rdir_log(uint64_t ap) {
+    volatile uint32_t *c = (volatile uint32_t *)0xfffffff00803b1ac;
+    char sn[24];
+    sn[0] = 0;
+    proc_selfname(sn, sizeof(sn));
+    if (!(sn[0] == 'c' && sn[1] == 'o' && sn[2] == 'n' && sn[3] == 't') && !(sn[0] == 'l' && sn[1] == 's' && sn[2] == 'd' && sn[3] == 0)) return;
+    if (*c >= 300) return;
+    *c = *c + 1;
+    char path[160];
+    int len = sizeof(path);
+    path[0] = 0;
+    int r = vn_getpath(*(void **)(ap + 8), path, &len);
+    uint64_t tv;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(tv));
+    printf("RDIR %llu %s[%d] %s\n", tv / 19200000ULL, sn, proc_selfpid(), path);
 }
