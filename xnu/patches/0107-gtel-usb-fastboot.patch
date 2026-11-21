@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..c68e5ce
 --- /dev/null
 +++ b/bsd/dev/gtel_usb.c
-@@ -0,0 +1,1230 @@
+@@ -0,0 +1,1239 @@
 +/*
 + * gtel MSM8916 ChipIdea HS-USB fastboot gadget + poweroff/reboot.
 + *
@@ -987,9 +987,12 @@ index 0000000..c68e5ce
 +		(void)ep1_tx_sync("OKAY", 4u);
 +	} else if (strncmp(cmd, "getvar:", 7) == 0) {
 +		(void)ep1_tx_sync("OKAY", 4u);
++	} else if (strcmp(cmd, "oem panic") == 0) {
++		/* test that a panic reboots back to lk2nd (needs debug= without DB_NMI) */
++		(void)ep1_tx_sync("OKAY", 4u);
++		panic("gtel: oem panic");
 +	} else if (strcmp(cmd, "poweroff") == 0 ||
-+	    strcmp(cmd, "oem poweroff") == 0 ||
-+	    strcmp(cmd, "oem shutdown") == 0) {
++	    strcmp(cmd, "oem poweroff") == 0) {
 +		(void)ep1_tx_sync("OKAY", 4u);
 +		gtel_do_poweroff();
 +	} else if (strcmp(cmd, "reboot-bootloader") == 0 ||
@@ -1140,17 +1143,23 @@ index 0000000..c68e5ce
 +	/* Attach D+ pull-up while preserving SESS_VLD_CTRL */
 +	usb_wr(USB_USBCMD, usb_rd(USB_USBCMD) | USBCMD_ITC_8 | USBCMD_ATTACH);
 +
-+	printf("gtel usb: ChipIdea HS-USB ready (ID=0x%08x, DMA=0x%08x)\n",
++	printf("gtel usb: ready ID=%x DMA=%x\n",
 +	    usb_rd(USB_ID), gu.dma_pa);
 +	if (gu.pon != 0) {
 +		uint8_t spare = 0xffu, ctl2 = 0xffu;
 +		(void)gtel_pon_read(PON_SOFT_RB_SPARE, &spare);
 +		(void)gtel_pon_read(PON_PS_HOLD_RESET_CTL2, &ctl2);
-+		printf("gtel usb: PM8916 PON SPMI ch=%d (spare=0x%02x ctl2=0x%02x)\n",
++		printf("gtel pon ch%d %x %x\n",
 +		    gu.pon_ch, spare, ctl2);
 +	}
 +
 +	for (;;) {
++		{ /* pet the APCS watchdog armed by gtel_display (pointer kept at a fixed scratch slot) */
++			volatile uint32_t *w = *(volatile uint32_t *volatile *)0xfffffff00803b2d0ULL;
++			if (w != NULL) {
++				w[1] = 1u;
++			}
++		}
 +		uint32_t sts = usb_rd(USB_USBSTS);
 +		if (sts) {
 +			usb_wr(USB_USBSTS, sts);
