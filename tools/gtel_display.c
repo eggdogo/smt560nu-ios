@@ -50,8 +50,29 @@ extern int printf(const char *fmt, ...);
 
 #define K_OS_BOOLEAN_FALSE (*(void * const *)0xfffffff00804d2e0ULL)
 
+/* MSM8916 APCS watchdog (qcom,kpss-wdt @ 0x0b017000, 32768 Hz). The gtel_usb poll loop pets it through
+ * the pointer at 0xfffffff00803b2d0; a panic or hard hang stops the pets and the bite resets to lk2nd. */
+extern uint64_t ml_io_map(uint64_t pa, uint64_t size);
+extern int PE_parse_boot_argn(const char *name, void *buf, int size);
+static void gtel_wdt_arm(void) {
+    volatile uint64_t *slot = (volatile uint64_t *)0xfffffff00803b2d0ULL;
+    if (*slot) return;
+    uint32_t secs = 30;
+    PE_parse_boot_argn("gtelwdt", &secs, sizeof(secs));
+    if (!secs) return;
+    volatile uint32_t *w = (volatile uint32_t *)ml_io_map(0x0B017000ULL, 0x1000);
+    if (!w) return;
+    w[2] = 0; w[1] = 1;
+    w[4] = (secs + 10) * 32768u;   /* bark (later than the bite) */
+    w[5] = secs * 32768u;          /* bite */
+    w[2] = 1;
+    *slot = (uint64_t)w;
+    printf("gtel wdt: armed, bite after %us without a pet\n", secs);
+}
+
 void gtel_publish_display_modes(void *fb) {
     if (!fb) return;
+    gtel_wdt_arm();
 
     // Refresh dictionary
     void *refresh = OSDictionary_withCapacity(4);
@@ -446,15 +467,24 @@ void gtel_surf_log(uint64_t s, uint64_t args) {
     uint64_t desc = *(volatile uint64_t *)(args + 0x68);
     if (!out) { printf("SURFREPLY no inline out (desc %p, size %u)\n", (void *)desc, osz); return; }
     {
-        /* The data mapping address is reported as -1 on re-lookups (IOSurfaceLock): remember the address given at create time and put it back. */
-        volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b1c0ULL;   /* 16 x {id, addr} */
+        /* The data mapping address is reported as -1 on re-lookups (IOSurfaceLock): remember the address given at create
+         * time and put it back. Mappings are per task, so key by (pid, id); 32 entries in the dead mmc buffer (only used before
+         * launchd), round-robin eviction. Bit 63 of the key marks an 800x1280 screen surface (for SCREENART). */
+        volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b2e0ULL;
+        volatile uint32_t *rr = (volatile uint32_t *)0xfffffff00803b4e0ULL;
         uint32_t sid = *(const uint32_t *)(out + 0x18);
         uint64_t ad = *(const uint64_t *)(out + 0);
+        uint64_t key = ((uint64_t)(uint32_t)proc_selfpid() << 32) | sid;
         int slot = -1;
-        for (int i = 0; i < 16; i++) if (tab[2 * i] == sid && sid != 0) { slot = i; break; }
-        if (ad != ~0ULL && ad != 0) {
-            if (slot < 0) for (int i = 0; i < 16; i++) if (tab[2 * i] == 0) { slot = i; break; }
-            if (slot >= 0) { tab[2 * slot] = sid; tab[2 * slot + 1] = ad; }
+        for (int i = 0; i < 32; i++) if ((tab[2 * i] & ~(1ULL << 63)) == key && sid) { slot = i; break; }
+        char pn[16];
+        proc_selfname(pn, sizeof(pn));
+        if (ad != ~0ULL && ad != 0 && gtel_streq(pn, "backboardd")) {   /* only the renderer: others' surfaces evicted its entries */
+            if (slot < 0) { slot = (*rr)++ & 31; }
+            if (*(const uint32_t *)(out + 0x20) == 800 && *(const uint32_t *)(out + 0x24) == 1280 && *(const uint32_t *)(out + 0x28) == 3328) {
+                key |= 1ULL << 63;
+            }
+            tab[2 * slot] = key; tab[2 * slot + 1] = ad;
         } else if (slot >= 0) {
             *(volatile uint64_t *)(out) = tab[2 * slot + 1];
         }
@@ -507,35 +537,65 @@ void gtel_regs_log(const char *name, int pid, int sig) {
  * output = the lock result that the client copies over its surface record, base address at +0). Map it onto the
  * kernel's lookup (selector 4), which answers with exactly that result structure. */
 uint32_t gtel_surf_pre(uint64_t args, uint32_t selector) {
-    {
-        volatile uint8_t *cnt = (volatile uint8_t *)0xfffffff00803b1b0ULL;   /* 16 per-selector counters */
-        uint32_t k = selector & 15;
-        if (cnt[k] < 3) {
-            cnt[k]++;
-            char sn[24];
-            sn[0] = 0;
-            proc_selfname(sn, sizeof(sn));
-            printf("SURFSEL %u from %s[%d]: scin %u insz %u scout %u outsz %u\n", selector, sn, proc_selfpid(),
-                   *(volatile uint32_t *)(args + 0x28), *(volatile uint32_t *)(args + 0x38),
-                   *(volatile uint32_t *)(args + 0x50), *(volatile uint32_t *)(args + 0x60));
+    if (selector == 3) {
+        const uint8_t *in3 = *(const uint8_t **)(args + 0x30);
+        /* SURFPIX disabled: its fixed 66560-byte stride read past small surfaces and the copyin
+         * fault hit vm_page_insert_internal "past object bounds" -> the random ~10 min panics. */
+        /* SCREENART: backboardd's 800x1280 BGRA screen surfaces (ids 2/3, bpr 3328): every 25th
+         * unlock, print a 32x16 luminance grid sampled strictly inside the surface. */
+        if (in3) {
+            char pn[20];
+            proc_selfname(pn, sizeof(pn));
+            uint32_t sid0 = *(const uint32_t *)in3;
+            volatile uint32_t *ac = (volatile uint32_t *)0xfffffff00803b2c8ULL;
+            if (gtel_streq(pn, "backboardd") && ((*ac)++ % 200) == 0) {
+                volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b2e0ULL;
+                uint64_t key = (1ULL << 63) | ((uint64_t)(uint32_t)proc_selfpid() << 32) | sid0;
+                for (int i = 0; i < 32; i++) if (tab[2 * i] == key) {
+                    static const char ramp[] = " .:-=+*#%@";
+                    char line[40];
+                    printf("ART %u %u\n", sid0, *ac);
+                    for (int yy = 0; yy < 16; yy++) {
+                        for (int xx = 0; xx < 32; xx++) {
+                            uint32_t v = 0;
+                            uint64_t ua = tab[2 * i + 1] + (uint64_t)(yy * 80 + 40) * 3328ULL + (uint64_t)(xx * 25 + 12) * 4ULL;
+                            copyin(ua, &v, 4);
+                            uint32_t lum = ((v & 0xff) + ((v >> 8) & 0xff) * 2 + ((v >> 16) & 0xff)) / 4;
+                            line[xx] = ramp[lum * 9 / 255];
+                        }
+                        line[32] = 0;
+                        printf("SA|%s|\n", line);
+                    }
+                    {   /* the panel's scanout buffer itself (PA 0x8e000000, 24 bpp, stride 2400), mapped once */
+                        volatile uint64_t *fbm = (volatile uint64_t *)0xfffffff00803b4e8ULL;
+                        if (!*fbm) *fbm = ml_io_map(0x8e000000ULL, 2400ULL * 1280);
+                        const volatile uint8_t *fb = (const volatile uint8_t *)*fbm;
+                        for (int yy = 0; yy < 16; yy++) {
+                            for (int xx = 0; xx < 32; xx++) {
+                                const volatile uint8_t *px = fb + (yy * 80 + 40) * 2400 + (xx * 25 + 12) * 3;
+                                uint32_t lum = (px[0] + px[1] * 2 + px[2]) / 4;
+                                line[xx] = ramp[lum * 9 / 255];
+                            }
+                            line[32] = 0;
+                            printf("FB|%s|\n", line);
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
-    if (selector == 3) {
-        volatile uint32_t *pc = (volatile uint32_t *)0xfffffff00803b1a8ULL;
-        const uint8_t *in3 = *(const uint8_t **)(args + 0x30);
-        if (in3 && *pc < 14) {
-            volatile uint64_t *tab = (volatile uint64_t *)0xfffffff00803b1c0ULL;
-            uint32_t sid = *(const uint32_t *)in3;
-            for (int i = 0; i < 16; i++) if (tab[2 * i] == sid && sid) {
-                *pc = *pc + 1;
-                uint32_t nz = 0, v, first = 0;
-                for (int k = 0; k < 64; k++) {
-                    uint64_t ua = tab[2 * i + 1] + (uint64_t)k * 66560ULL + 4;
-                    if (copyin(ua, &v, 4) == 0 && v != 0xff000000u && v != 0) { nz++; if (!first) first = v; }
-                }
-                printf("SURFPIX id %u nonzero %u/64 first %x\n", sid, nz, first);
-                break;
-            }
+    {
+        volatile uint32_t *mc = (volatile uint32_t *)0xfffffff00803b188ULL;
+        uint32_t n = *mc + 1;
+        *mc = n;
+        if (n % 150 == 1) {
+            uint64_t tv;
+            __asm__ volatile("mrs %0, cntvct_el0" : "=r"(tv));
+            printf("MEM %llu s free %u act %u inact %u spec %u wired %u compressed %u (4K pages)\n", tv / 19200000ULL,
+                   *(volatile uint32_t *)0xfffffff007bc9278ULL, *(volatile uint32_t *)0xfffffff007bc935cULL,
+                   *(volatile uint32_t *)0xfffffff007bc9354ULL, *(volatile uint32_t *)0xfffffff007bc9358ULL,
+                   *(volatile uint32_t *)0xfffffff007bc37e0ULL, *(volatile uint32_t *)0xfffffff007babfccULL);
         }
     }
     if (selector == 33) return 4;   /* IOSurfaceLookup(id): scalar id in, full surface record out */
@@ -559,29 +619,61 @@ extern int mmc_read_block(uint64_t lba, uint32_t *buf);
 void gtel_mmc_fast(uint32_t khz) {
     sdhci_set_clock_khz(khz);
     volatile uint8_t *hc = (volatile uint8_t *)*(volatile uint64_t *)0xfffffff00803a900ULL;
-    static uint32_t blk[128];
+    /* the display slot has no BSS: a static buffer here relocates to garbage. Use free scratch RAM
+     * (0xfffffff00803b2e0..b4e0, inside the dead ud_log_thread chunk, below _sweet_null_parsed at b518). */
+    uint32_t *blk = (uint32_t *)0xfffffff00803b2e0ULL;
     uint32_t r = 0;
-    /* BUS_WIDTH (index 183) = 2: 8-bit SDR */
-    if (mmc_cmd(6, (3u << 24) | (183u << 16) | (2u << 8), 0x1b, &r)) { printf("gtel mmc: fast: CMD6 width failed\n"); return; }
-    hc[0x28] = (uint8_t)(hc[0x28] | 0x20);
-    /* HS_TIMING (index 185) = 1 */
-    if (mmc_cmd(6, (3u << 24) | (185u << 16) | (1u << 8), 0x1b, &r)) { printf("gtel mmc: fast: CMD6 timing failed\n"); }
-    else {
-        hc[0x28] = (uint8_t)(hc[0x28] | 0x04);
-        sdhci_set_clock_khz(50000);
-    }
+    /* BUS_WIDTH (index 183) = 1: 4-bit SDR, same 25 MHz clock, no HS timing */
+    printf("gtel mmc: step1 CMD6 width\n");
+    if (mmc_cmd(6, (3u << 24) | (183u << 16) | (1u << 8), 0x1b, &r)) { printf("gtel mmc: fast: CMD6 width failed\n"); return; }
+    /* R1b: wait for DAT0 high (present state bit 20) before touching the bus again */
+    uint32_t spins = 0;
+    while (!(*(volatile uint32_t *)(hc + 0x24) & (1u << 20)) && spins < 50000000u) spins++;
+    printf("gtel mmc: step2 busy done spins %u r 0x%x\n", spins, r);
+    if (spins >= 50000000u) { printf("gtel mmc: busy timeout, staying 1-bit\n"); return; }
+    hc[0x28] = (uint8_t)(hc[0x28] | 0x02);
+    printf("gtel mmc: step3 host 4-bit, test read\n");
     int bad = mmc_read_block(1, blk);
+    if (!bad && blk[0] == 0x20494645 && blk[1] == 0x54524150) {
+        /* 4-bit is good: try 8-bit + HS timing at 50 MHz, falling back to 4-bit/25 MHz */
+        uint32_t w8 = 1;
+        PE_parse_boot_argn("gtelmmc8", &w8, sizeof(w8));
+        if (w8 && !mmc_cmd(6, (3u << 24) | (183u << 16) | (2u << 8), 0x1b, &r)) {
+            spins = 0;
+            while (!(*(volatile uint32_t *)(hc + 0x24) & (1u << 20)) && spins < 50000000u) spins++;
+            hc[0x28] = (uint8_t)((hc[0x28] & ~0x02u) | 0x20);
+            int ok8 = !mmc_read_block(1, blk) && blk[0] == 0x20494645 && blk[1] == 0x54524150;
+            printf("gtel mmc: 8-bit test %s (r 0x%x)\n", ok8 ? "ok" : "FAILED", r);
+            if (ok8 && !mmc_cmd(6, (3u << 24) | (185u << 16) | (1u << 8), 0x1b, &r)) {
+                spins = 0;
+                while (!(*(volatile uint32_t *)(hc + 0x24) & (1u << 20)) && spins < 50000000u) spins++;
+                hc[0x28] = (uint8_t)(hc[0x28] | 0x04);
+                sdhci_set_clock_khz(50000);
+                int okhs = !mmc_read_block(1, blk) && blk[0] == 0x20494645 && blk[1] == 0x54524150;
+                if (okhs) { printf("gtel mmc: fast mode on: 8-bit, 50 MHz HS\n"); return; }
+                printf("gtel mmc: HS 50 MHz FAILED, back to 25 MHz\n");
+                sdhci_set_clock_khz(25000);
+                hc[0x28] = (uint8_t)(hc[0x28] & ~0x04u);
+                mmc_cmd(6, (3u << 24) | (185u << 16) | (0u << 8), 0x1b, &r);
+                if (!mmc_read_block(1, blk) && blk[0] == 0x20494645) { printf("gtel mmc: fast mode on: 8-bit, 25 MHz\n"); return; }
+            }
+            /* back to 4-bit */
+            mmc_cmd(6, (3u << 24) | (183u << 16) | (1u << 8), 0x1b, &r);
+            spins = 0;
+            while (!(*(volatile uint32_t *)(hc + 0x24) & (1u << 20)) && spins < 50000000u) spins++;
+            hc[0x28] = (uint8_t)((hc[0x28] & ~0x24u) | 0x02);
+            bad = mmc_read_block(1, blk);
+        }
+    }
     if (!bad && !(blk[0] == 0x20494645 && blk[1] == 0x54524150)) bad = 1;
     if (bad) {
         printf("gtel mmc: fast mode verify failed, back to 1-bit 25 MHz\n");
         sdhci_set_clock_khz(25000);
-        hc[0x28] = (uint8_t)(hc[0x28] & ~0x04u);
-        mmc_cmd(6, (3u << 24) | (185u << 16) | (0u << 8), 0x1b, &r);
         mmc_cmd(6, (3u << 24) | (183u << 16) | (0u << 8), 0x1b, &r);
-        hc[0x28] = (uint8_t)(hc[0x28] & ~0x20u);
+        hc[0x28] = (uint8_t)(hc[0x28] & ~0x02u);
         return;
     }
-    printf("gtel mmc: fast mode on: 8-bit, 50 MHz\n");
+    printf("gtel mmc: fast mode on: 4-bit, 25 MHz\n");
 }
 
 /* hfs_vnop_readdir() entry hook: which directory is a daemon enumerating (and how often)? */
@@ -601,4 +693,19 @@ void gtel_rdir_log(uint64_t ap) {
     uint64_t tv;
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(tv));
     printf("RDIR %llu %s[%d] %s\n", tv / 19200000ULL, sn, proc_selfpid(), path);
+}
+
+/* vm_page_insert_internal "past object bounds" panic: print the caller frame chain (debug_buf is
+ * not set up on gtel, so the normal panic backtrace never reaches the console log). */
+void gtel_panic_bt(uint64_t fp) {
+    char name[20];
+    proc_selfname(name, sizeof(name));
+    printf("\nPANICBT %s:", name);
+    for (int i = 0; i < 20; i++) {
+        if (fp < 0xfffffff000000000ULL || (fp & 7)) break;
+        uint64_t *f = (uint64_t *)fp;
+        printf(" 0x%llx", (unsigned long long)f[1]);
+        fp = f[0];
+    }
+    printf("\n");
 }

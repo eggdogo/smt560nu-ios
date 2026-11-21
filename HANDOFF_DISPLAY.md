@@ -290,3 +290,64 @@ Usage note: weekly plan usage was 36% at this point.
 - 07:30 update: tablet recovered (user power-cycled). With the LSEnumerate patch SpringBoard gets past lsd; later it blocked once in `LSApplicationWorkspace addObserver` (lsd's install-progress queue busy encoding the server store = slow, not dead), and in the newest boots SB's main thread runs real CF/UIKit code. mediaserverd surfaces 7/9/12/14 hold non-black pixels; backboardd's screen surfaces 2/3 stay black (SB has not committed a layer tree yet).
 - Boots now reset into lk2nd spontaneously after 8-16 min (no panic text in the log). Suspect low battery after a night of testing; lk2nd exposes no battery vars. Check charging first.
 - Image to use: `shim-boot-0111v.img` (kernel.vB, sweetsample=SpringBoard); fast eMMC OFF.
+
+## 2026-11-20 10:10 - eMMC width test
+
+- Fresh userdata: hfs_mark_inconsistent 0, but the tablet still resets about 9.5 min in. MEM lines are flat (free 1-2k pages, inactive and speculative pages reclaimable, compressed 0), so it is not RAM pressure.
+- SpringBoard at the reset: FBSystemAppMain -> DNDSServer init -> CNContactStore, plus BKSTerminationAssertionClient bootstrap lookups. It never reaches drawing; backboardd screen surfaces 2/3 stay all black.
+- GTEL_MMC_FAST=1 with **4-bit at 25 MHz only** (no HS timing) ALSO hangs before the USB gadget (shim-boot-0113a.img). Both 8-bit/50 and 4-bit/25 hang, so the width switch itself is the problem (CMD6 R1b busy wait? host ctrl write?). Next: log each step, or wait for busy on DAT0 after CMD6.
+- A stuck lk2nd USB (stale OKAY in the IN pipe) can be recovered remotely: drain IN, then write `reboot-bootloader`.
+
+## 2026-11-20 21:45 - APPLE LOGO ON THE PANEL
+
+- photos/2026-11-20_first_apple_logo.jpg. backboardd draws the boot logo through IOMFB swaps.
+- What unlocked it: eMMC 8-bit 50 MHz HS (GTEL_MMC_FAST=1, gtel_mmc_fast). The earlier "hangs" were a static buffer in the BSS-less display slot -> panic -> debug=0xc spin.
+- The random ~10 min resets were my SURFPIX probe (fixed 66560 stride copyin past small surfaces -> vm_page_insert_internal past-bounds panic). Disabled.
+- debug=0x8 (no DB_NMI): panics reboot to lk2nd. tools/ramlog.py reads the last log from RAM via lk2nd oem debug readq. PANICBT hook on the vm_page_insert panic.
+- FBCON=0 local_pack.sh env turns off the kernel text console.
+
+## 2026-11-21 morning: SpringBoard unblocked, boot logo removed, nothing composited yet
+- DMIsMigrationNeeded block -> store NO (0x183da1900): no visible effect (datamigrator still runs).
+- **SpringBoard main thread was hung in WiFiManagerClientRegister** (sync MIG to wifid). Fixed:
+  `___WiFiManagerClientGetServerPort` (0x18c24e128) -> `mov w0,#0; ret`. SB t0 now idles in UIApplicationMain's run loop.
+- BKSSystemApplicationClient checkIn -> `b finishBooting` (0x183810ccc): logo still there.
+- backboardd on disk is decmpfs type 4 (zlib chunks, rsrc fork at userdata block 1019012).
+  `tools/bbd_overlay_patch.py` recompresses chunk 6 with `-[BKBootUIPresenter _queue_addOverlay]` and
+  `_queue_addUnderlay` -> `ret`. hfs_locate.py now prints resource-fork extents.
+  Result: backboardd stops rendering entirely (no surface CPU access); the logo layer was the only content.
+  SB did talk to [CARenderServer] (3 sends) but commits no visible layers.
+- Framebuffer surface ids are not stable (2/3 in one run, 13/14 in another): SCREENART filter on ids 2/3 should
+  match backboardd + 800x1280 instead.
+- sweethidtest=60: Home presses still "(0 clients)". backboardd registers a HIDServiceSupport match notification
+  but never opens the esuc user client (or the open isn't logged). Next: log newUserClient/open in SweetHID,
+  check iOS 12 IOHIDFamily's expected user client type/properties (SweetHID was written against iOS 16.7's).
+  Hypothesis: SB keeps the lock screen hidden until a wake/backlight event, which needs working HID.
+
+## 2026-11-21 ~10:50: SPRINGBOARD UI RENDERING (lock screen clock visible in SCREENART)
+Chain of fixes this morning (all dscpatch lines in tools/reset_userdata.sh unless noted):
+- `___WiFiManagerClientGetServerPort` -> 0 (SB main thread hung on wifid).
+- `-[MTXPCConnectionProvider didReceiveLifecycleNotification]` -> ret (sema wait on mobiletimerd).
+- `-[MadGate getActivationState:]` -> nil (sync XPC to mobileactivationd).
+- `_figXPC_PingServerConnection` -> -1 (mediaserverd services hidden; avoid long sync waits).
+- `BKSSystemApplicationClient checkIn` -> b finishBooting; `BKSDisplayRenderOverlay presentWithAnimationSettings:` -> NO.
+- backboardd on-disk patch `tools/bbd_overlay_patch.py` (decmpfs chunk 6): `_queue_addOverlay`/`_queue_addUnderlay` -> ret,
+  `BKBootUIOverlayVendor currentOverlayWithLevel:` -> nil (verified live with a brk test: crash at 0x10006bf34).
+- **The persistent Apple logo was `PUIProgressWindow` (ProgressUI)**: `-[PUIProgressWindow setVisible:]` (0x1948c6734) -> ret.
+- Kernel (tools/gtel_display.c, kernel.vB.grey / shim-boot-0114g.img): surface address fix-up table is now 32 entries keyed by
+  (pid, id), backboardd only, in the dead mmc buffer at 0xfffffff00803b2e0; this ended the CA::OGL::SW::scanline crash loop
+  (base -1 on re-lookups). SCREENART now finds the screen surfaces by size, samples every 200 unlocks, no cap
+  (the old 40-snapshot cap made every run look like "still the logo"). Grey-fill of new screen surfaces is still in (harmless).
+- SURFSEL debug print removed to fit the display slot (12830/13488).
+Result (console_log_0114ae.txt): backboardd 0 crashes, SB 1 launch, screen = white with a status bar line and a large
+changing clock row (`@@ :@@`). Home presses still "(0 clients)" (HID not opened by backboardd) — next for input.
+- **Scanout check (console_log_0114af.txt, kernel.vB.fbart / shim-boot-0114fb.img):** SCREENART (header now `ART <id> <n>`) also prints
+  `FB|` lines sampled from the panel scanout memory PA 0x8e000000 (24 bpp, stride 2400, mapped once, VA kept at 0xfffffff00803b4e8).
+  The scanout holds the same white screen and the identical clock row as backboardd's surface. Some FB rows show a repeating `:=:`
+  pattern: likely the 24-bpp sampling assumption vs. the 32-bpp swap copy, or areas outside the swap. Grey-fill test removed for room.
+
+## 2026-11-21 ~11:40: DISPLAY WORKING — iOS 12 "Hello" setup screen on the panel
+Photo: photos/2026-11-21_hello_setup_screen.jpg. Image shim-boot-0114nc.img (kernel.vB.fbart) + boot-arg `sweetfb_noconsole=1`
+(without it the kernel console text is drawn over the UI). The "clock" in SCREENART was the cycling "Hello" text.
+First frames arrive ~10-12 min after boot (1 CPU). Status bar shows "iPad" and 1% battery (no battery driver).
+Next: HID input (backboardd registers a HIDServiceSupport first-match notification but never opens SweetHID), battery/gas gauge,
+boot speed (SMP), and move the dscpatch/kernel binary patches into real source patches.

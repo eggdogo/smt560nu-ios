@@ -22,6 +22,8 @@ import re,sys
 s=open(sys.argv[1]).read()
 print(re.search(r'mkpayload\.py.*?--cmdline \"([^\"]*)\"', s, re.S).group(1))" "$REPO_DIR/.github/workflows/pack.yml")
 # RD=ufsroot0 boots the root from the eMMC instead of the ramdisk
+if [ -n "$CPUS" ]; then CMDLINE=$(echo "$CMDLINE" | sed "s/cpus=[^ ]*/cpus=$CPUS/"); fi
+if [ -n "$FBCON" ]; then CMDLINE=$(echo "$CMDLINE" | sed "s/gtel_fbcon=[^ ]*/gtel_fbcon=$FBCON/"); fi
 if [ -n "$RD" ]; then CMDLINE=$(echo "$CMDLINE" | sed "s/rd=[^ ]*/rd=$RD/"); fi
 # EXTRA="sweetsample=launchd ..." adds boot-args; a sweetsample there replaces the default
 if [ -n "$EXTRA" ]; then

@@ -31,6 +31,7 @@ EXT_SYMS = {
     '_FlushPoC_Dcache':           0xFFFFFFF007418C10,
     '_FlushPoC_DcacheRegion':     0xFFFFFFF007418E64,
     '_PE_parse_boot_argn':        0xFFFFFFF007A57C40,
+    '_panic':                     0xFFFFFFF007A887D4,
     '_SecureDTLookupEntry':       0xFFFFFFF007A56DF0,
     '_assert_wait_deadline':      0xFFFFFFF0072DA730,
     '_clock_interval_to_deadline': 0xFFFFFFF0072A0550,
@@ -177,6 +178,7 @@ extern void CleanPoC_DcacheRegion(vm_offset_t va, size_t len);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t len);
 extern void FlushPoC_Dcache(void);
 extern void delay(int us);
+extern void panic(const char *fmt, ...) __attribute__((noreturn));
 extern void clock_interval_to_deadline(uint64_t interval, uint64_t scale_factor, uint64_t *result);
 extern wait_result_t assert_wait_deadline(event_t event, int interruptible, uint64_t deadline);
 extern wait_result_t thread_block(thread_continue_t continuation);
@@ -461,6 +463,7 @@ def main():
     surf_pre_va = disp_syms['_gtel_surf_pre']
     rdir_log_va = disp_syms['_gtel_rdir_log']
     mmc_fast_va = disp_syms['_gtel_mmc_fast']
+    panic_bt_va = disp_syms['_gtel_panic_bt']
     print(f'Relocated gtel_display: code={len(disp_blob)}/{DISP_CODE_MAX}')
 
     # 3. Write USB slot
@@ -674,6 +677,16 @@ def main():
     ]
     disp_slot.extend(struct.pack(f'<{len(rd_tramp)}I', *rd_tramp))
 
+    pb_va = DISP_CODE_BASE + len(disp_slot)
+    pb_tramp = [
+        0xA9BA7BFD, 0xA90107E0, 0xA9020FE2, 0xA90317E4, 0x910003FD,
+        0xF94003E0,                                              # ldr x0, [sp] (caller fp)
+        encode_bl(pb_va + 24, panic_bt_va, True),                # bl gtel_panic_bt(fp)
+        0xA94107E0, 0xA9420FE2, 0xA94317E4, 0xA8C67BFD,
+        encode_bl(pb_va + 44, 0xFFFFFFF007A887D4, False),        # b _panic
+    ]
+    disp_slot.extend(struct.pack(f'<{len(pb_tramp)}I', *pb_tramp))
+
     assert len(disp_slot) <= DISP_CODE_MAX, f'disp_slot overflow: {len(disp_slot)} > {DISP_CODE_MAX}'
     data[disp_foff:disp_foff + DISP_CODE_MAX] = b'\x00' * DISP_CODE_MAX
     data[disp_foff:disp_foff + len(disp_slot)] = disp_slot
@@ -705,6 +718,11 @@ def main():
     if os.environ.get('GTEL_MMC_FAST') == '1':   # experimental: hung the tablet on 2026-11-20 (no USB afterwards), off by default
         patch_u32(data, fo(0xFFFFFFF00748E8B8), encode_bl(0xFFFFFFF00748E8B8, 0xFFFFFFF00748F340, True),
                   encode_bl(0xFFFFFFF00748E8B8, mmc_fast_va, True), 'eMMC: 8-bit HS 50 MHz after the 25 MHz clock call')
+    # process sampler: 200 samples every 63 s (was 40 x 15 s = only the first 10 minutes)
+    patch_u32(data, fo(0xFFFFFFF00748D4D4), 0x531C6D09, 0x531A6509, 'sampler interval lsl #4 -> #6 (63 s)')
+    patch_u32(data, fo(0xFFFFFFF00748D4E4), 0x7100A33F, 0x7103233F, 'sampler count 40 -> 200')
+    patch_u32(data, fo(0xFFFFFFF0073C0FDC), encode_bl(0xFFFFFFF0073C0FDC, 0xFFFFFFF007A887D4, True),
+              encode_bl(0xFFFFFFF0073C0FDC, pb_va, True), 'vm_page_insert past-bounds panic -> PANICBT')
     patch_u32(data, fo(0xFFFFFFF007785210), 0xD10483FF,
               encode_bl(0xFFFFFFF007785210, rd_va, False), 'hook hfs_vnop_readdir entry (RDIR log)')
     patch_u32(data, fo(0xFFFFFFF0077CA5A0), 0xD102C3FF,
